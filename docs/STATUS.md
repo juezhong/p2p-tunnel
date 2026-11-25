@@ -44,6 +44,12 @@
 - 断链边界：状态流失效后真实断开链路，仍走 ticket 16 的 5 秒判定报「断开连接」退出 `0`，不误报「对端已退出」；退出后同一端口可立即重绑，无残留 listener/任务。
 - 证据：`cargo test -p tunnel-core --test farewell`（新增 4 个用例：状态流告别、状态流畸形 Farewell、专用流畸形 Farewell、状态流失效后 5 秒断链）与 `--lib` 新增 `farewell_on_state_stream_signals_session_end`、畸形 Farewell 帧拒绝用例。
 
+## 2026-11-25：票据 19 CLI 双进程端到端
+
+- 新增 `crates/tunnel-cli/tests/two_process.rs`：起两个真实二进制，用 stdin 交换 INVITE/REPLY 完成真实 SDK 配对；A `quit` 后断言 A 退出 0、B 打印 `[对端] 对端已退出` 并退出 0、A 的监听端口退出后可立即重绑。
+- 覆盖范围：进程拼装层（stdin 驱动、事件循环排空、进程退出码、端口释放）；core 语义（1 秒告别、5 秒断链）仍由 `tests/farewell.rs` 与 mock 用例覆盖。
+- 本地耗时约 5 秒；`cargo test --workspace` 153 passed。
+
 ## 2026-11-25：两轴审阅修复（`feat/review-fixes`）
 
 - `docs/ARCHITECTURE.md` 与实现对齐：补齐 CLI `input.rs`/`output.rs` 模块、`InputEvent`/逐字节 stdin、`exit` 退出路径；会话结束按本端退出、对端 `Farewell`、5 秒断链分开描述，`SessionLost` 只对应认证失败/链路停止。
@@ -72,7 +78,7 @@
 | --- | --- |
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
-| `cargo test --workspace` | **152 passed**（tunnel-core 单元 80 + `farewell` 7 + `listener_echo` 14 + `rule_sync` 8 + tunnel-cli 单元 21 + 黑盒 21） |
+| `cargo test --workspace` | **153 passed**（tunnel-core 单元 81 + `farewell` 7 + `listener_echo` 14 + `rule_sync` 8 + tunnel-cli 单元 21 + 黑盒 21 + 双进程 1） |
 | 真实 SDK 双进程环回 | 2026-11-24 ticket 06/10 手工记录（配对、双向 echo、close/RemoteClosed、审计 `result=ok`）；记录在 `.tmp/`，不提交 |
 | 退出清理与端口重绑 | core 用例 `shutdown_releases_listener_port_for_immediate_rebind`、`peer_farewell_ends_session_and_rsts_active_connections`；`listener_echo` 断开连接后立即 `bind` 同端口成功 |
 | 真机跨平台 | 见上表：macOS ↔ Windows、Termux ↔ Linux |
@@ -102,7 +108,7 @@
 | 告别帧只在状态流可用时生效 | 状态流已失败的会话收不到对端告别，仍按 ticket 16 的 5 秒断开判定处理；畸形/截断告别只让对端规则未知，不结束会话。由 ticket 17 的 core 集成测试覆盖，无双机人工记录。 |
 | Windows tty 行为 | **不具备**：没有 Windows console API 实现，CLI 走行模式，无清行重绘/半行恢复；ticket 14 的 tty 行为仅在 unix raw mode 下成立。 |
 | 连接路径摘要 | CLI 在配对完成时显示一次类别（`同网直连`/`NAT 打洞`），不显示 IP/端口；真实字段只在发布核验时内部查看。 |
-| CLI 双进程端到端 | **未自动化**：告别/断开退出码 `0` 的双进程 CLI 端到端未写测试；现有 mock 双 `Session` 与真实 SDK 环回（同进程）覆盖 core 语义，`crates/tunnel-cli/tests/cli.rs` 只驱动单进程管道。 |
+| CLI 双进程端到端 | **已自动化**（2026-11-25 票据 19）：`crates/tunnel-cli/tests/two_process.rs` 启动两个真实二进制，经 stdin 交换 INVITE/REPLY 完成真实 SDK 配对，断言 A `quit` 后双方退出码 0、B 打印「对端已退出」、监听端口可立即重绑；本地约 5 秒。 |
 
 ## 现在能做什么
 
@@ -115,7 +121,5 @@
 
 v0.1 实现票已全部关闭归档；后续按工作区 `.scratch/p2p-tunnel-v0/map.md` 的 Not yet specified 重新拆票。
 
-1. Windows console 输入/重绘（票据 14 在 Windows 的缺口）。
-2. CLI 双进程端到端自动化（告别/断开退出码 0）。
-3. 08 边界项补留档：端口冲突、目标 RST、Termux 后台、Windows 防火墙、Termux 构建记录。
-4. TUI（v0.2）/GUI（v0.3）。
+1. TUI（v0.2）/GUI（v0.3）。
+2. 已知限制（用户决定不做，不再排期）：Windows console 清行重绘、Termux 后台进程限制、Windows 防火墙真机留档。
