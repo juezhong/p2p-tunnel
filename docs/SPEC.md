@@ -659,6 +659,7 @@ $ p2p-tunnel
   - `peer_session` 用比较码的哈希或会话内稳定标识；v0.1 没有持久设备身份，不声称能区分“同一设备的不同会话”。
 - 不记录 INVITE/REPLY、会话密钥、完整证书。
 - 诊断：发布前用 `TransportDiagnostic` 的 `actual_local_udp` / `actual_remote_udp` / `remote_candidate_kind` / `stun_consistency` / `gateway_mapping` / `authenticated_peer_reflexive` 作为无中继证据；截图/日志脱敏保存。
+- 这些字段只用于发布核验，**不落日志、不进 `status`、不出现在任何界面**：真实 IP/端口始终不暴露。CLI 仅在「配对完成」提示里显示一次类别摘要（`同网直连` / `NAT 打洞` / `端口映射直连` / `直连`）；日志若开启 `RUST_LOG=info`，也只记录类别与映射一致性，不记录地址。
 - 诊断是快照，不是事件流；不把 localhost 当 NAT 证据。
 
 ---
