@@ -1,0 +1,17 @@
+[package]
+name = "tunnel-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "p2p-tunnel"
+path = "src/main.rs"
+
+[dependencies]
+tunnel-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
