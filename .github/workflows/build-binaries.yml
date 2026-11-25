@@ -1,0 +1,221 @@
+name: Build binaries
+
+# 六个平台的可发布产物由本工作流统一构建：
+# 只有这里会产出 release 二进制，测试工作流不再顺带上传产物。
+on:
+  workflow_call:
+    inputs:
+      upload-artifacts:
+        description: 是否上传产物（CI 用于真机验收，Release 用于发布）
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64-gnu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: native
+            smoke: native
+          - platform: linux-aarch64-gnu
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: cross
+            smoke: none
+          - platform: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: cross
+            smoke: native
+          - platform: linux-aarch64-musl
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: cross
+            smoke: qemu
+          - platform: android-aarch64
+            os: ubuntu-latest
+            target: aarch64-linux-android
+            build: ndk
+            smoke: android
+          - platform: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: native
+            smoke: native
+          - platform: macos-aarch64
+            os: macos-15
+            target: aarch64-apple-darwin
+            build: native
+            smoke: native
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Linux 跨架构/跨 libc：cross 在容器里带好工具链。
+      - name: Build (cross)
+        if: matrix.build == 'cross'
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--locked --release --workspace"
+
+      # Android 必须用 NDK 构建：bionic 只接受 PIE，且要求 TLS 段 64 字节对齐。
+      # NDK r28 起 arm64 的 TLS 段默认 64 字节对齐；更老的 NDK 会被 Android 16 拒绝。
+      - name: Set up Android NDK
+        if: matrix.build == 'ndk'
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+          add-to-path: false
+
+      - name: Build (android)
+        if: matrix.build == 'ndk'
+        id: android_build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          ndk="${{ steps.ndk.outputs.ndk-path }}"
+          tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cc="$tc/aarch64-linux-android24-clang"
+          "$cc" --version
+          export CC_aarch64_linux_android="$cc"
+          export AR_aarch64_linux_android="$tc/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$cc"
+          # 只对目标 crate 生效，避免污染 host 构建脚本。
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+          cargo build --locked --release --workspace --target aarch64-linux-android 2>&1 | tee "$RUNNER_TEMP/android-build.log"
+
+      # 日志接口需要 admin 权限，失败时把构建日志当产物传上来。
+      - name: Upload Android build log
+        if: always() && matrix.build == 'ndk'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: ${{ runner.temp }}/android-build.log
+          if-no-files-found: ignore
+
+      - name: Fail if Android build failed
+        if: steps.android_build.outcome == 'failure'
+        run: exit 1
+
+      - name: Build (native)
+        if: matrix.build == 'native'
+        run: cargo build --locked --release --workspace --target ${{ matrix.target }}
+
+      # 冒烟测试：产物必须真的能启动，避免“编出来但跑不了”。
+      - name: Smoke test (native)
+        if: matrix.smoke == 'native'
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/p2p-tunnel"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          "$bin" --version
+          "$bin" --help > /dev/null
+
+      - name: Set up QEMU
+        if: matrix.smoke == 'qemu'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Smoke test (qemu)
+        if: matrix.smoke == 'qemu'
+        shell: bash
+        run: |
+          file "target/${{ matrix.target }}/release/p2p-tunnel"
+          "target/${{ matrix.target }}/release/p2p-tunnel" --version
+
+      - name: Smoke test android PIE
+        if: matrix.smoke == 'android'
+        id: android_pie
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/p2p-tunnel"
+          if file "$bin" | grep -q 'pie executable'; then
+            echo "pie=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "pie=no" >> "$GITHUB_OUTPUT"
+            file "$bin"
+            echo "::error::android binary is not a PIE executable"
+            exit 1
+          fi
+
+      # 没有 TLS 段就没有对齐问题；有 TLS 段时要求 ARM64 bionic 的 64 字节对齐。
+      - name: Smoke test android TLS alignment
+        if: matrix.smoke == 'android'
+        id: android_tls
+        continue-on-error: true
+        shell: bash
+        run: |
+          ndk="${{ steps.ndk.outputs.ndk-path }}"
+          tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          bin="target/${{ matrix.target }}/release/p2p-tunnel"
+          al=$("$tc/llvm-readelf" -l "$bin" | awk '$1 == "TLS" {print $NF}' | tr -d ' ')
+          al=${al:-none}
+          echo "align=$al" >> "$GITHUB_OUTPUT"
+          echo "align=$al" > "$RUNNER_TEMP/android-smoke.log"
+          echo "TLS alignment: $al"
+          if [ "$al" = "none" ]; then
+            echo "no TLS program header; nothing to align"
+            exit 0
+          fi
+          if [ $((al)) -lt 64 ]; then
+            echo "::error::android TLS alignment $al < 64"
+            exit 1
+          fi
+
+      - name: Upload Android smoke report
+        if: always() && matrix.smoke == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-smoke-pie-${{ steps.android_pie.outputs.pie }}-tls-${{ steps.android_tls.outputs.align }}
+          path: ${{ runner.temp }}/android-smoke.log
+          if-no-files-found: error
+
+      - name: Fail if Android checks failed
+        if: steps.android_pie.outcome == 'failure' || steps.android_tls.outcome == 'failure'
+        run: exit 1
+
+      - name: Ad-hoc sign (macOS)
+        if: matrix.platform == 'macos-aarch64'
+        run: |
+          codesign --force --sign - "target/${{ matrix.target }}/release/p2p-tunnel"
+          codesign --verify --verbose "target/${{ matrix.target }}/release/p2p-tunnel"
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd "target/${{ matrix.target }}/release"
+          bin=p2p-tunnel
+          if [ -f p2p-tunnel.exe ]; then bin=p2p-tunnel.exe; fi
+          node -e "const c=require('crypto'),p=require('path'),f=require('fs');const b=process.argv[1];const h=c.createHash('sha256').update(f.readFileSync(b)).digest('hex');f.writeFileSync('SHA256SUMS',h+'  '+p.basename(b)+'\n')" "$bin"
+
+      - name: Upload artifact
+        if: ${{ inputs.upload-artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-tunnel-${{ matrix.platform }}
+          path: |
+            target/${{ matrix.target }}/release/p2p-tunnel
+            target/${{ matrix.target }}/release/p2p-tunnel.exe
+            target/${{ matrix.target }}/release/SHA256SUMS
+          if-no-files-found: error

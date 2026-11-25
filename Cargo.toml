@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tunnel-core",
+    "crates/tunnel-cli",
+    "crates/tunnel-tui",
+    "crates/tunnel-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-2.0-only"
+repository = "https://github.com/juezhong/p2p-tunnel"
+
+[workspace.dependencies]
+# 固定 SDK 基线；必须提交 Cargo.lock，见 docs/SPEC.md §15.1。
+p2p-sdk = { git = "https://github.com/juezhong/p2p-sdk", rev = "d4cdd2ed47285248da31e54abbdc6e27f99361d2" }
+quinn = "0.11"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+tunnel-core = { path = "crates/tunnel-core" }
+
+[profile.release]
+lto = "thin"

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 测试只在本机原生平台跑；产物由 build-binaries.yml 统一构建。
+  test:
+    name: test (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64-gnu
+          - os: windows-latest
+            platform: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 静态检查只在 Linux 跑一遍：两平台结果相同，Windows 留测试覆盖即可。
+      - name: cargo fmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      # UI 边界：CLI/TUI/GUI 不得接触 quinn / p2p_sdk 类型（docs/SPEC.md §4.2）。
+      - name: UI boundary guard
+        if: runner.os == 'Linux'
+        run: |
+          if grep -RIn -E '\b(use|extern crate) (quinn|p2p_sdk)\b|p2p_sdk::|quinn::' \
+              crates/tunnel-cli crates/tunnel-tui crates/tunnel-gui; then
+            echo "::error::UI crates must not reference quinn or p2p_sdk types"
+            exit 1
+          fi
+
+  # 六个平台的 release 产物：由独立工作流构建，CI 也用它产出真机验收包。
+  build:
+    name: build binaries
+    uses: ./.github/workflows/build-binaries.yml

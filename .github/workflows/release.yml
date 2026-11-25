@@ -1,0 +1,50 @@
+name: Release
+
+# tag 推送才发布：v0.1.0 / v0.1.0-rc.1 等。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build binaries
+    uses: ./.github/workflows/build-binaries.yml
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Stage release assets
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          # 七个平台的二进制都叫 p2p-tunnel(/exe)，直接上传会互相覆盖；
+          # 按 docs/ARTIFACTS.md 的发布命名重命名后再打校验和。
+          mkdir -p release
+          for dir in dist/p2p-tunnel-*; do
+            [ -d "$dir" ] || continue
+            platform="${dir#dist/p2p-tunnel-}"
+            for src in "$dir/p2p-tunnel" "$dir/p2p-tunnel.exe"; do
+              [ -f "$src" ] || continue
+              ext=""
+              case "$src" in *.exe) ext=".exe" ;; esac
+              cp "$src" "release/p2p-tunnel-${REF}-${platform}${ext}"
+            done
+          done
+          ls -l release
+          ( cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: release/*
