@@ -5,7 +5,12 @@
 //!
 //! 交互与文案规格：`docs/SPEC.md` §8。
 
-use std::io::{self, BufRead, Write};
+mod input;
+mod output;
+
+use input::{EditAction, InputEvent, LineEditor};
+use output::Output;
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -33,7 +38,7 @@ p2p-tunnel — 安全的 P2P TCP 端口转发
   close <本机端口>           关闭自己的规则（活动连接会被重置）
   status                     显示链路、本机规则、对端规则、活动连接
   help                       显示命令帮助
-  quit                       优雅退出（也可用 Ctrl-C）
+  quit / exit                优雅退出（也可用 Ctrl-C）
   1 / create                 创建连接（生成 INVITE）
   2 / join                   加入连接（粘贴对方的 INVITE）
 
@@ -48,11 +53,13 @@ fn main() -> ExitCode {
     match args.as_slice() {
         [] => {}
         [arg] if arg == "-h" || arg == "--help" => {
-            print!("{HELP}");
+            let mut out = Output::new(io::stdout(), false);
+            out.block(HELP.trim_end());
             return ExitCode::SUCCESS;
         }
         [arg] if arg == "-V" || arg == "--version" => {
-            println!("p2p-tunnel {}", env!("CARGO_PKG_VERSION"));
+            let mut out = Output::new(io::stdout(), false);
+            out.line(&format!("p2p-tunnel {}", env!("CARGO_PKG_VERSION")));
             return ExitCode::SUCCESS;
         }
         _ => {
@@ -76,31 +83,6 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(run())
-}
-
-/// 打印命令提示符并立刻刷新（管道/终端都要看得见）。
-fn prompt() {
-    print!("> ");
-    let _ = io::stdout().flush();
-}
-
-/// 这个事件是否会输出行；静默事件（连接计数）不补打提示符。
-fn event_prints(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::InviteCode(_)
-            | Event::ReplyCode(_)
-            | Event::ComparisonCode(_)
-            | Event::Ready
-            | Event::LinkState(_)
-            | Event::RulesChanged
-            | Event::PeerRules(_)
-            | Event::PeerRulesUnknown
-            | Event::PeerRulesStale
-            | Event::RemoteClosed { .. }
-            | Event::ListenerStarted(_)
-            | Event::Error(_)
-    )
 }
 
 fn init_tracing() {
@@ -130,58 +112,88 @@ fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
 }
 
 async fn run() -> ExitCode {
-    println!(
+    // 终端里接管 stdin：逐字符读入才能保存“敲了一半的命令”。
+    // 非 tty（脚本/管道）继续走行读取，输出层也不发控制序列。
+    let raw_mode = if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        input::RawMode::enable()
+    } else {
+        None
+    };
+    let mut out = Output::new(io::stdout(), raw_mode.is_some());
+
+    out.line(&format!(
         "p2p-tunnel v{} — 安全的 P2P TCP 端口转发",
         env!("CARGO_PKG_VERSION")
-    );
-    println!("{MENU}");
-
-    // 没有 readline：提示符在每次命令/事件输出后补打，用户随时知道可以输入。
-    prompt();
+    ));
+    out.line(MENU);
+    out.prompt();
 
     let mut session = Session::spawn();
     let commands = session.sender();
 
     // stdin 读取放到独立线程，主循环用 select! 同时处理事件与输入。
     // 通道有界：核心处理不过来时读线程阻塞，输入不会在内存里堆积。
-    let (line_tx, mut line_rx) = mpsc::channel::<String>(STDIN_CHANNEL);
-    std::thread::spawn(move || {
-        forward_lines(io::stdin().lock(), &line_tx);
-    });
+    let (input_tx, mut input_rx) = mpsc::channel::<InputEvent>(STDIN_CHANNEL);
+    if raw_mode.is_some() {
+        input::spawn_tty_reader(input_tx);
+    } else {
+        std::thread::spawn(move || {
+            input::forward_lines(io::stdin().lock(), &input_tx);
+        });
+    }
+    let mut editor = LineEditor::new();
 
     let mut ui = UiState::default();
     loop {
         tokio::select! {
-            incoming = line_rx.recv() => {
+            incoming = input_rx.recv() => {
                 match incoming {
-                    Some(line) => {
-                        if !handle_input(line.trim(), &commands, &mut ui).await {
+                    Some(InputEvent::Line(line)) => {
+                        if !handle_input(line.trim(), &commands, &mut ui, &mut out).await {
                             break;
                         }
-                        prompt();
+                        out.prompt();
                     }
+                    Some(InputEvent::Byte(byte)) => match editor.feed(byte) {
+                        EditAction::None => {}
+                        EditAction::Redraw => out.set_input(editor.text()),
+                        EditAction::Submit => {
+                            out.submit_line();
+                            let line = editor.take_line();
+                            if !handle_input(line.trim(), &commands, &mut ui, &mut out).await {
+                                break;
+                            }
+                            out.prompt();
+                        }
+                        EditAction::Interrupt => {
+                            out.end_prompt();
+                            if !out.is_tty() {
+                                out.line("");
+                            }
+                            out.line("收到 Ctrl-C，正在退出…");
+                            break;
+                        }
+                        EditAction::Eof => break,
+                    },
                     // stdin EOF（管道结束或 Ctrl-D）按 quit 处理。
-                    None => break,
+                    Some(InputEvent::Eof) | None => break,
                 }
             }
             event = session.recv() => {
                 match event {
                     Some(event) => {
-                        let speaks = event_prints(&event);
-                        if let Some(command) = handle_event(event, &mut ui) {
-                            send(&commands, command).await;
+                        if let Some(command) = handle_event(event, &mut ui, &mut out) {
+                            send(&commands, command, &mut out).await;
                         }
                         if ui.session_lost {
                             break;
                         }
-                        if speaks {
-                            prompt();
-                        }
+                        out.prompt();
                     }
                     None => {
                         // core 未收到 Shutdown 就结束：属于运行错误。
                         if !ui.session_lost {
-                            eprintln!("[!] core 已退出");
+                            out.line("[!] core 已退出");
                             ui.session_lost = true;
                         }
                         break;
@@ -189,7 +201,11 @@ async fn run() -> ExitCode {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                println!("\n收到 Ctrl-C，正在退出…");
+                out.end_prompt();
+                if !out.is_tty() {
+                    out.line("");
+                }
+                out.line("收到 Ctrl-C，正在退出…");
                 break;
             }
         }
@@ -197,16 +213,17 @@ async fn run() -> ExitCode {
 
     // 退出前把 core 已经发出但还没渲染的事件排空（例如刚提交 add 就 quit 的
     // 错误回包），避免用户看不到错误。总预算仍是 SHUTDOWN_WAIT。
+    out.end_prompt();
     ui.exiting = true;
     let _ = commands.send(Command::Shutdown).await;
     let _ = tokio::time::timeout(SHUTDOWN_WAIT, async {
         while let Some(event) = session.recv().await {
-            let _ = handle_event(event, &mut ui);
+            let _ = handle_event(event, &mut ui, &mut out);
         }
     })
     .await;
     let _ = tokio::time::timeout(SHUTDOWN_WAIT, session.shutdown()).await;
-    println!("已退出。");
+    out.line("已退出。");
 
     if ui.session_lost {
         ExitCode::from(1)
@@ -216,10 +233,15 @@ async fn run() -> ExitCode {
 }
 
 /// 处理一行输入；返回 `false` 表示退出主循环。
-async fn handle_input(line: &str, commands: &mpsc::Sender<Command>, ui: &mut UiState) -> bool {
+async fn handle_input<W: Write>(
+    line: &str,
+    commands: &mpsc::Sender<Command>,
+    ui: &mut UiState,
+    out: &mut Output<W>,
+) -> bool {
     if line.is_empty() {
         if ui.awaiting == Awaiting::Invite {
-            println!("[!] INVITE 不能为空");
+            out.line("[!] INVITE 不能为空");
         }
         return true;
     }
@@ -230,76 +252,87 @@ async fn handle_input(line: &str, commands: &mpsc::Sender<Command>, ui: &mut UiS
     // 等待粘贴 INVITE/REPLY 时仍允许控制命令，避免用户被锁死在这一步。
     // 合法配对码以 `P2PR-` 开头，不会与这些命令冲突。help/status/quit
     // 只在这里匹配一次，下面的普通命令分支不再重复。
-    if matches!(command, "3" | "quit") {
+    // `exit` 与 `quit` 等价；单字符 `q`/`?` 不是别名，保持未知命令。
+    if matches!(command, "3" | "quit" | "exit") {
         return false;
     }
     if command == "help" {
-        println!("{HELP}");
+        out.block(HELP);
         return true;
     }
     if command == "status" {
-        print_status(ui);
+        print_status(ui, out);
         return true;
     }
 
     if ui.awaiting != Awaiting::None {
         // 其余整行都当作配对码，成功送出后退出等待状态。
         match std::mem::replace(&mut ui.awaiting, Awaiting::None) {
-            Awaiting::Reply => send(commands, Command::ProvideReply(line.to_string())).await,
-            Awaiting::Invite => send(commands, Command::JoinInvite(line.to_string())).await,
+            Awaiting::Reply => send(commands, Command::ProvideReply(line.to_string()), out).await,
+            Awaiting::Invite => send(commands, Command::JoinInvite(line.to_string()), out).await,
             Awaiting::None => unreachable!("上面已确认存在等待状态"),
         }
         return true;
     }
     match command {
         "1" | "create" => {
-            send(commands, Command::CreateInvite).await;
+            send(commands, Command::CreateInvite, out).await;
         }
         "2" | "join" => {
             ui.awaiting = Awaiting::Invite;
-            println!("粘贴对方的 INVITE：");
+            out.line("粘贴对方的 INVITE：");
         }
-        "add" => handle_add(parts.collect(), commands, ui).await,
-        "close" => handle_close(parts.collect(), commands, ui).await,
+        "add" => handle_add(parts.collect(), commands, ui, out).await,
+        "close" => handle_close(parts.collect(), commands, ui, out).await,
         other => {
-            println!("[!] 未知命令：{other}（输入 help 查看帮助）");
+            out.line(&format!("[!] 未知命令：{other}（输入 help 查看帮助）"));
         }
     }
     true
 }
 
-async fn handle_add(args: Vec<&str>, commands: &mpsc::Sender<Command>, ui: &mut UiState) {
+async fn handle_add<W: Write>(
+    args: Vec<&str>,
+    commands: &mpsc::Sender<Command>,
+    ui: &mut UiState,
+    out: &mut Output<W>,
+) {
     if args.len() != 2 {
-        println!("[!] 用法：add <本机端口> <对端端口>");
+        out.line("[!] 用法：add <本机端口> <对端端口>");
         return;
     }
     let (listen_port, peer_port) = match (parse_port(args[0]), parse_port(args[1])) {
         (Some(listen_port), Some(peer_port)) => (listen_port, peer_port),
         _ => {
-            println!("[!] 端口必须是 1–65535");
+            out.line("[!] 端口必须是 1–65535");
             return;
         }
     };
     match Forward::new(listen_port, peer_port) {
         Ok(forward) => {
             ui.pending_add = Some(forward);
-            send(commands, Command::AddForward(forward)).await;
+            send(commands, Command::AddForward(forward), out).await;
         }
-        Err(error) => println!("[!] {error}"),
+        Err(error) => out.line(&format!("[!] {error}")),
     }
 }
 
-async fn handle_close(args: Vec<&str>, commands: &mpsc::Sender<Command>, ui: &mut UiState) {
+async fn handle_close<W: Write>(
+    args: Vec<&str>,
+    commands: &mpsc::Sender<Command>,
+    ui: &mut UiState,
+    out: &mut Output<W>,
+) {
     if args.len() != 1 {
-        println!("[!] 用法：close <本机端口>");
+        out.line("[!] 用法：close <本机端口>");
         return;
     }
     let Some(listen_port) = parse_port(args[0]) else {
-        println!("[!] 端口必须是 1–65535");
+        out.line("[!] 端口必须是 1–65535");
         return;
     };
     if !ui.local.iter().any(|rule| rule.listen_port == listen_port) {
-        println!("[!] 没有本机规则监听 {listen_port}");
+        out.line(&format!("[!] 没有本机规则监听 {listen_port}"));
         return;
     }
     ui.pending_close = ui
@@ -309,7 +342,7 @@ async fn handle_close(args: Vec<&str>, commands: &mpsc::Sender<Command>, ui: &mu
         .copied();
     ui.local.retain(|rule| rule.listen_port != listen_port);
     ui.active.remove(&listen_port);
-    send(commands, Command::CloseForward { listen_port }).await;
+    send(commands, Command::CloseForward { listen_port }, out).await;
 }
 
 fn parse_port(raw: &str) -> Option<u16> {
@@ -385,9 +418,9 @@ fn format_status(ui: &UiState) -> Vec<String> {
     lines
 }
 
-fn print_status(ui: &UiState) {
+fn print_status<W: Write>(ui: &UiState, out: &mut Output<W>) {
     for line in format_status(ui) {
-        println!("{line}");
+        out.line(&line);
     }
 }
 
@@ -399,21 +432,21 @@ fn link_label(state: LinkState) -> &'static str {
     }
 }
 
-fn handle_event(event: Event, ui: &mut UiState) -> Option<Command> {
+fn handle_event<W: Write>(event: Event, ui: &mut UiState, out: &mut Output<W>) -> Option<Command> {
     match event {
         Event::InviteCode(code) => {
-            println!("INVITE（通过可信渠道发给对方）：");
-            println!("{code}");
+            out.line("INVITE（通过可信渠道发给对方）：");
+            out.line(&code);
             ui.awaiting = Awaiting::Reply;
-            println!("粘贴对方的 REPLY：");
+            out.line("粘贴对方的 REPLY：");
         }
         Event::ReplyCode(code) => {
-            println!("REPLY（通过可信渠道发给对方）：");
-            println!("{code}");
+            out.line("REPLY（通过可信渠道发给对方）：");
+            out.line(&code);
         }
         Event::ComparisonCode(code) => {
             // v0.1 不阻塞人工核对：打印比较码后自动确认，配对立即继续。
-            println!("比较码：{code}（已自动确认；v0.1 不阻塞配对）");
+            out.line(&format!("比较码：{code}（已自动确认；v0.1 不阻塞配对）"));
             return Some(Command::ConfirmComparison);
         }
         Event::Ready => {
@@ -421,8 +454,8 @@ fn handle_event(event: Event, ui: &mut UiState) -> Option<Command> {
             // 未来事件源变化时把“配对完成”重复打印成重连提示。
             if !ui.ready_seen {
                 ui.ready_seen = true;
-                println!("[+] 配对完成，已连接");
-                println!("现在可用 add <本机端口> <对端端口> 新增规则，或输入 help 查看命令。");
+                out.line("[+] 配对完成，已连接");
+                out.line("现在可用 add <本机端口> <对端端口> 新增规则，或输入 help 查看命令。");
             }
         }
         Event::LinkState(state) => {
@@ -431,43 +464,46 @@ fn handle_event(event: Event, ui: &mut UiState) -> Option<Command> {
             ui.peer_unknown = false;
             // 正常退出时 core 也会发 Stopped；这是收尾信号，不是状态变化。
             if !(ui.exiting && state == LinkState::Stopped) {
-                println!("链路: {}", link_label(state));
+                out.line(&format!("链路: {}", link_label(state)));
             }
         }
         Event::RulesChanged => {
             // close 成功没有单独事件：RulesChanged 到达时确认关闭结果。
             if let Some(closed) = ui.pending_close.take() {
-                println!("[-] {} 已关闭（活动连接已重置）", closed.listen_port);
+                out.line(&format!(
+                    "[-] {} 已关闭（活动连接已重置）",
+                    closed.listen_port
+                ));
             }
         }
         Event::PeerRules(rules) => {
             ui.peer = rules;
             ui.peer_stale = false;
             ui.peer_unknown = false;
-            print_status(ui);
+            print_status(ui, out);
         }
         Event::PeerRulesUnknown => {
             ui.peer_unknown = true;
-            println!("[!] 规则同步状态流不可用，对端规则未知（数据面不受影响）");
+            out.line("[!] 规则同步状态流不可用，对端规则未知（数据面不受影响）");
         }
         Event::PeerRulesStale => {
             ui.peer_stale = true;
-            println!("[!] 对端规则：链路重连中，可能已过期");
+            out.line("[!] 对端规则：链路重连中，可能已过期");
         }
         Event::RemoteClosed { listen_port } => {
-            println!("[对端] 远程主动断开了 {listen_port}");
+            out.line(&format!("[对端] 远程主动断开了 {listen_port}"));
         }
         Event::ListenerStarted(listen_port) => {
             if let Some(pending) = ui.pending_add.take() {
                 if pending.listen_port == listen_port {
                     ui.local.push(pending);
-                    println!(
+                    out.line(&format!(
                         "[+] 127.0.0.1:{} -> 对端:{} 监听中",
                         pending.listen_port, pending.peer_port
-                    );
+                    ));
                 }
             } else {
-                println!("[+] 127.0.0.1:{listen_port} 监听中");
+                out.line(&format!("[+] 127.0.0.1:{listen_port} 监听中"));
             }
         }
         Event::ConnectionOpened { listen_port } => {
@@ -502,30 +538,16 @@ fn handle_event(event: Event, ui: &mut UiState) -> Option<Command> {
                     ui.local.push(closed);
                 }
             }
-            println!("[!] {error}");
+            out.line(&format!("[!] {error}"));
         }
     }
 
     None
 }
 
-/// 把 stdin 行送入有界通道；通道满时阻塞调用线程（背压）。
-fn forward_lines<R: BufRead>(reader: R, lines: &mpsc::Sender<String>) {
-    for line in reader.lines() {
-        match line {
-            Ok(line) => {
-                if lines.blocking_send(line).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-async fn send(commands: &mpsc::Sender<Command>, command: Command) {
+async fn send<W: Write>(commands: &mpsc::Sender<Command>, command: Command, out: &mut Output<W>) {
     if commands.send(command).await.is_err() {
-        println!("[!] core 已退出");
+        out.line("[!] core 已退出");
     }
 }
 
@@ -562,7 +584,6 @@ struct UiState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
     fn connected_ui() -> UiState {
@@ -627,31 +648,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_aliases_are_treated_as_unknown_commands() {
-        let (tx, mut rx) = mpsc::channel(4);
+    async fn exit_is_equivalent_to_quit() {
+        let (tx, _rx) = mpsc::channel(4);
         let mut ui = UiState::default();
-        // `exit`/`?` 不在 SPEC §8.2 命令表内，已删除；输入它们不再退出。
-        assert!(handle_input("exit", &tx, &mut ui).await);
-        assert!(handle_input("?", &tx, &mut ui).await);
-        assert!(rx.try_recv().is_err(), "别名不应产生 core 命令");
+        let mut out = Output::new(Vec::new(), false);
+        assert!(
+            !handle_input("exit", &tx, &mut ui, &mut out).await,
+            "exit 应与 quit 一样结束主循环"
+        );
     }
 
-    #[test]
-    fn stdin_forwarding_uses_bounded_backpressure() {
-        let (tx, mut rx) = mpsc::channel::<String>(2);
-        let input: String = (0..10_000).map(|index| format!("line-{index}\n")).collect();
-        let writer = std::thread::spawn(move || forward_lines(Cursor::new(input), &tx));
-
-        // 只有 2 个名额：生产者必须阻塞，而不是把一万行全读进内存。
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!writer.is_finished(), "有界通道应在满时阻塞生产者");
-
-        let mut count = 0usize;
-        while rx.blocking_recv().is_some() {
-            count += 1;
+    #[tokio::test]
+    async fn single_char_aliases_remain_unknown_commands() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut ui = UiState::default();
+        let mut out = Output::new(Vec::new(), false);
+        // 只有 `quit`/`exit`/菜单 `3` 是退出写法；单字符 `q`/`?` 仍是未知命令。
+        for alias in ["q", "?"] {
+            assert!(handle_input(alias, &tx, &mut ui, &mut out).await);
+            assert!(rx.try_recv().is_err(), "未知命令不应产生 core 命令");
         }
-        writer.join().expect("写线程结束");
-        assert_eq!(count, 10_000);
+        let text = String::from_utf8(out.into_writer()).expect("输出应为 UTF-8");
+        assert!(
+            text.contains("[!] 未知命令：q（输入 help 查看帮助）"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[!] 未知命令：?（输入 help 查看帮助）"),
+            "{text}"
+        );
     }
 
     /// 收集日志输出的内存 writer，实现 `MakeWriter` 以便测试 CLI 的过滤规则。

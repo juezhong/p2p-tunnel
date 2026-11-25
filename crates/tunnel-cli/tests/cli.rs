@@ -422,3 +422,80 @@ fn ctrl_c_exits_zero_within_deadline() {
         .expect("读取 stdout 失败");
     assert!(stdout.contains("已退出。"), "stdout:\n{stdout}");
 }
+
+#[test]
+fn exit_alias_exits_zero_and_prints_goodbye() {
+    let out = run(&[], "exit\n");
+    assert_success(&out);
+    assert!(out.stdout.contains(MENU_LINE), "stdout:\n{}", out.stdout);
+    assert!(
+        out.stdout.trim_end().ends_with("已退出。"),
+        "stdout:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn menu_three_still_exits() {
+    let out = run(&[], "3\n");
+    assert_success(&out);
+    assert!(
+        out.stdout.trim_end().ends_with("已退出。"),
+        "stdout:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn help_lists_exit_and_quit_but_not_single_char_q() {
+    let out = run(&[], "help\nquit\n");
+    assert_success(&out);
+    assert!(
+        out.stdout.contains("quit / exit"),
+        "help 未列出退出别名\nstdout:\n{}",
+        out.stdout
+    );
+    // `q` 不是别名，帮助里不能把单字符 q 列成退出写法。
+    assert!(
+        !out.stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("q ")),
+        "help 不应列出 q\nstdout:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn single_char_q_and_question_mark_remain_unknown_commands() {
+    let out = run(&[], "q\n?\nquit\n");
+    assert_success(&out);
+    assert!(
+        out.stdout.contains("[!] 未知命令：q（输入 help 查看帮助）"),
+        "stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("[!] 未知命令：?（输入 help 查看帮助）"),
+        "stdout:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn empty_enter_does_not_stack_prompts_or_emit_control_sequences() {
+    let out = run(&[], "\n\n\nquit\n");
+    assert_success(&out);
+    // 连续空回车没有任何输出，提示符只保留一个。
+    assert_eq!(
+        out.stdout.matches("> ").count(),
+        1,
+        "提示符不应叠加\nstdout:\n{}",
+        out.stdout
+    );
+    // 管道输入/输出下不出现清行等 ANSI 序列。
+    assert!(
+        !out.stdout.contains('\x1b'),
+        "非 tty 输出不应有控制序列\nstdout:\n{}",
+        out.stdout
+    );
+}

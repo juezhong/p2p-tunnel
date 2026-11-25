@@ -15,3 +15,7 @@ tunnel-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# 只用于 unix 终端 raw mode（tty 逐字符输入）；Windows 走普通行读取。
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
