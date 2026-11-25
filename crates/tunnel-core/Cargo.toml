@@ -1,0 +1,22 @@
+[package]
+name = "tunnel-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+p2p-sdk.workspace = true
+quinn.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `start_paused` 用于 5 秒 open_bi 超时测试，不需要真的等 5 秒。
+tokio = { workspace = true, features = ["test-util"] }
+# 目标端审计日志断言（SPEC §10）：捕获 info 级输出检查字段。
+tracing-subscriber.workspace = true
