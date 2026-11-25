@@ -1,0 +1,2 @@
+# .bat 以 CRLF 签出（port_forwarding.bat 是 GBK + CRLF）
+*.bat text eol=crlf
