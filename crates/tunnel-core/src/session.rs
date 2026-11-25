@@ -1590,7 +1590,9 @@ mod tests {
         tokio::time::timeout(REAL_SDK_WAIT, async {
             let (creator, mut joiner) = loopback_ready_sessions().await;
             creator.shutdown().await;
-            tokio::time::timeout(Duration::from_secs(2), async {
+            // 1 秒语义由 mock 用例精确断言（tests/farewell.rs）；真实 SDK 端到端
+            // 还要算上 UDP 握手与 CI 调度，Windows 慢机曾超过 2 秒，放宽到 5 秒。
+            tokio::time::timeout(Duration::from_secs(5), async {
                 next_ok(&mut joiner, |event| matches!(event, Event::PeerFarewell)).await;
                 next_ok(&mut joiner, |event| {
                     matches!(event, Event::LinkState(LinkState::Stopped))
@@ -1598,7 +1600,7 @@ mod tests {
                 .await;
             })
             .await
-            .expect("对端应在 1 秒内识别 Farewell（允许 2 秒调度余量）");
+            .expect("对端应在 5 秒内识别 Farewell（CI 调度余量）");
             joiner.shutdown().await;
         })
         .await
