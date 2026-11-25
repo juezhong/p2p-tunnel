@@ -25,7 +25,7 @@ const STDIN_CHANNEL: usize = 64;
 
 const MENU: &str = "1) 创建连接   2) 加入连接   3) 退出";
 
-const HELP: &str = "\
+const HELP_COMMON: &str = "\
 p2p-tunnel — 安全的 P2P TCP 端口转发
 
 用法:
@@ -33,19 +33,31 @@ p2p-tunnel — 安全的 P2P TCP 端口转发
   p2p-tunnel --help     显示本帮助
   p2p-tunnel --version  显示版本
 
-启动后可用命令:
+命令:
   add <本机端口> <对端端口>   新增一条本机规则并开始监听 127.0.0.1
   close <本机端口>           关闭自己的规则（活动连接会被重置）
   status                     显示链路、本机规则、对端规则、活动连接
   help                       显示命令帮助
   quit / exit                优雅退出（也可用 Ctrl-C）
-  1 / create                 创建连接（生成 INVITE；配对前）
-  2 / join                   加入连接（粘贴对方的 INVITE；配对前）
+";
+
+/// 配对前的帮助额外列出配对命令；已连接后 `create`/`join` 会被拒绝，不再展示。
+const HELP_PAIRING: &str = "\
+  create                     创建连接（生成 INVITE）
+  join                       加入连接（粘贴对方的 INVITE）
 
 说明:
   - 监听地址固定 127.0.0.1，目标固定为对端 127.0.0.1:<端口>。
   - 配对即信任：只和可信设备配对；配对后对端可访问本机任意 loopback 端口。
   - INVITE/REPLY 必须通过可信私密渠道交换。
+";
+
+const HELP_READY: &str = "\
+配对已完成；要重新配对请退出后重新启动。
+
+说明:
+  - 监听地址固定 127.0.0.1，目标固定为对端 127.0.0.1:<端口>。
+  - 配对即信任：配对后对端可访问本机任意 loopback 端口。
 ";
 
 fn main() -> ExitCode {
@@ -54,7 +66,7 @@ fn main() -> ExitCode {
         [] => {}
         [arg] if arg == "-h" || arg == "--help" => {
             let mut out = Output::new(io::stdout(), false);
-            out.block(HELP.trim_end());
+            out.block(HELP_COMMON.trim_end());
             return ExitCode::SUCCESS;
         }
         [arg] if arg == "-V" || arg == "--version" => {
@@ -232,6 +244,16 @@ async fn run() -> ExitCode {
     }
 }
 
+fn print_help<W: Write>(ui: &UiState, out: &mut Output<W>) {
+    if ui.ready_seen {
+        out.block(HELP_COMMON.trim_end());
+        out.block(HELP_READY.trim_end());
+    } else {
+        out.block(HELP_COMMON.trim_end());
+        out.block(HELP_PAIRING.trim_end());
+    }
+}
+
 /// 处理一行输入；返回 `false` 表示退出主循环。
 async fn handle_input<W: Write>(
     line: &str,
@@ -258,7 +280,7 @@ async fn handle_input<W: Write>(
         return false;
     }
     if command == "help" {
-        out.block(HELP);
+        print_help(ui, out);
         return true;
     }
     if command == "status" {

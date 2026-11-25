@@ -440,10 +440,7 @@ fn menu_numbers_work_before_pairing() {
     // 启动菜单的 1/2/3 是配对前入口：1 生成 INVITE，3 直接退出。
     let out = run_with_steps(
         &[],
-        &[
-            ("1\n", Duration::from_millis(800)),
-            ("quit\n", Duration::ZERO),
-        ],
+        &[("1\n", Duration::from_secs(3)), ("quit\n", Duration::ZERO)],
         Some("error"),
     );
     assert_success(&out);
@@ -463,6 +460,20 @@ fn menu_numbers_work_before_pairing() {
     assert!(
         out.stdout.trim_end().ends_with("已退出。"),
         "stdout:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn help_never_lists_numeric_aliases() {
+    // 帮助里只列文字命令；1/2/3 只出现在启动菜单，且配对后不再有效。
+    let out = run(&[], "help\nquit\n");
+    assert_success(&out);
+    assert!(out.stdout.contains("create"), "stdout:\n{}", out.stdout);
+    assert!(out.stdout.contains("join"), "stdout:\n{}", out.stdout);
+    assert!(
+        !out.stdout.contains("1 / create") && !out.stdout.contains("2 / join"),
+        "帮助不应出现数字别名\nstdout:\n{}",
         out.stdout
     );
 }

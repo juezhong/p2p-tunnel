@@ -190,6 +190,19 @@ fn quit_ends_both_processes_with_exit_code_zero() {
     a.wait_for("[!] 已连接，不能再次配对", PAIR_TIMEOUT);
     a.send("1");
     a.wait_for("未知命令：1", PAIR_TIMEOUT);
+
+    // 已连接后的帮助不再展示 create/join（这两个命令此时会被拒绝）。
+    a.send("help");
+    a.wait_for("配对已完成；要重新配对请退出后重新启动", PAIR_TIMEOUT);
+    let text = a.text();
+    let help_start = text
+        .find("配对已完成；要重新配对请退出后重新启动")
+        .expect("帮助已打印");
+    let help_tail = &text[help_start..];
+    assert!(
+        !help_tail.contains("create") && !help_tail.contains("join"),
+        "已连接后的帮助不应展示配对命令\n帮助:\n{help_tail}"
+    );
     a.send("3");
     a.wait_for("未知命令：3", PAIR_TIMEOUT);
 
