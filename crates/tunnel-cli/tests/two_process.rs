@@ -190,6 +190,8 @@ fn quit_ends_both_processes_with_exit_code_zero() {
     a.wait_for("[!] 已连接，不能再次配对", PAIR_TIMEOUT);
     a.send("1");
     a.wait_for("未知命令：1", PAIR_TIMEOUT);
+    a.send("3");
+    a.wait_for("未知命令：3", PAIR_TIMEOUT);
 
     // A 退出：A 应退出 0，B 应打印「对端已退出」后退出 0。
     a.send("quit");

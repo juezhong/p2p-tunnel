@@ -42,8 +42,8 @@ cargo build --release -p tunnel-cli
 ```text
 # A（创建方）
 $ target/release/p2p-tunnel
-输入 create 创建连接，join 加入连接；help 查看命令，quit 退出。
-> create
+1) 创建连接   2) 加入连接   3) 退出
+> 1
 INVITE（通过可信渠道发给对方）：
 P2PR-INV2-...
 粘贴对方的 REPLY：
@@ -87,9 +87,12 @@ ssh -p 2211 user@127.0.0.1
 | `close <本机端口>` | 关闭自己的规则；该规则的活动连接被重置 |
 | `status` | 显示链路、本机规则、对端规则、活动连接 |
 | `help` | 帮助 |
-| `quit` / `exit` / `3` | 优雅退出（等同 `Shutdown`；也可 Ctrl-C） |
-| `1` / `create` | 创建连接，生成 INVITE |
-| `2` / `join` | 加入连接，粘贴对方 INVITE |
+| `quit` / `exit` | 优雅退出（等同 `Shutdown`；也可 Ctrl-C） |
+| `1` / `create` | 创建连接，生成 INVITE（`1` 仅配对前） |
+| `2` / `join` | 加入连接，粘贴对方 INVITE（`2` 仅配对前） |
+| `3` | `quit` 的菜单别名（仅配对前） |
+
+数字 `1`/`2`/`3` 只在配对前有效；已连接后按未知命令处理。
 
 命令行参数只有 `--help` / `--version`；其余参数按用法错误处理，退出码 `2`。退出码约定：`0` 正常（含对端主动退出、链路断开 5 秒未恢复）、`1` 运行错误（含认证失败导致的会话丢失）、`2` 参数错误。
 

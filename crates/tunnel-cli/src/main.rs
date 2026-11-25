@@ -23,7 +23,7 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 /// stdin 行通道容量：有界，读线程在通道满时阻塞（背压），不会无界增长。
 const STDIN_CHANNEL: usize = 64;
 
-const MENU: &str = "输入 create 创建连接，join 加入连接；help 查看命令，quit 退出。";
+const MENU: &str = "1) 创建连接   2) 加入连接   3) 退出";
 
 const HELP: &str = "\
 p2p-tunnel — 安全的 P2P TCP 端口转发
@@ -39,8 +39,8 @@ p2p-tunnel — 安全的 P2P TCP 端口转发
   status                     显示链路、本机规则、对端规则、活动连接
   help                       显示命令帮助
   quit / exit                优雅退出（也可用 Ctrl-C）
-  create                     创建连接（生成 INVITE）
-  join                       加入连接（粘贴对方的 INVITE）
+  1 / create                 创建连接（生成 INVITE；配对前）
+  2 / join                   加入连接（粘贴对方的 INVITE；配对前）
 
 说明:
   - 监听地址固定 127.0.0.1，目标固定为对端 127.0.0.1:<端口>。
@@ -253,7 +253,8 @@ async fn handle_input<W: Write>(
     // 合法配对码以 `P2PR-` 开头，不会与这些命令冲突。help/status/quit
     // 只在这里匹配一次，下面的普通命令分支不再重复。
     // `exit` 与 `quit` 等价；单字符 `q`/`?` 不是别名，保持未知命令。
-    if matches!(command, "quit" | "exit") {
+    // `3` 只在配对前作为菜单快捷退出；配对后 CLI 里数字一律不支持。
+    if matches!(command, "quit" | "exit") || (command == "3" && !ui.ready_seen) {
         return false;
     }
     if command == "help" {
@@ -280,16 +281,27 @@ async fn handle_input<W: Write>(
         return true;
     }
     match command {
-        "create" => {
+        // 数字菜单只在配对前有效（启动菜单）；配对完成后数字一律不支持。
+        "1" | "create" => {
             if ui.ready_seen {
-                out.line(PAIR_WHILE_CONNECTED);
+                let message = if command == "1" {
+                    "[!] 未知命令：1（输入 help 查看帮助）"
+                } else {
+                    PAIR_WHILE_CONNECTED
+                };
+                out.line(message);
                 return true;
             }
             send(commands, Command::CreateInvite, out).await;
         }
-        "join" => {
+        "2" | "join" => {
             if ui.ready_seen {
-                out.line(PAIR_WHILE_CONNECTED);
+                let message = if command == "2" {
+                    "[!] 未知命令：2（输入 help 查看帮助）"
+                } else {
+                    PAIR_WHILE_CONNECTED
+                };
+                out.line(message);
                 return true;
             }
             ui.awaiting = Awaiting::Invite;

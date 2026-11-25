@@ -193,7 +193,7 @@ fn quit_exits_zero_and_prints_goodbye() {
     );
 }
 
-const MENU_LINE: &str = "输入 create 创建连接，join 加入连接；help 查看命令，quit 退出。";
+const MENU_LINE: &str = "1) 创建连接   2) 加入连接   3) 退出";
 
 #[test]
 fn status_shows_required_sections_in_order() {
@@ -436,20 +436,33 @@ fn exit_alias_exits_zero_and_prints_goodbye() {
 }
 
 #[test]
-fn numeric_menu_aliases_are_unknown_commands() {
-    // 数字看起来像选项，容易在已连接后误触发配对；统一按未知命令处理。
-    let out = run(&[], "1\n2\n3\nquit\n");
+fn menu_numbers_work_before_pairing() {
+    // 启动菜单的 1/2/3 是配对前入口：1 生成 INVITE，3 直接退出。
+    let out = run_with_steps(
+        &[],
+        &[
+            ("1\n", Duration::from_millis(800)),
+            ("quit\n", Duration::ZERO),
+        ],
+        Some("error"),
+    );
     assert_success(&out);
-    for number in ["1", "2", "3"] {
-        assert!(
-            out.stdout.contains(&format!("未知命令：{number}")),
-            "stdout:\n{}",
-            out.stdout
-        );
-    }
     assert!(
-        !out.stdout.contains("配对失败"),
-        "数字不应触发配对\nstdout:\n{}",
+        out.stdout.contains("INVITE（通过可信渠道发给对方）"),
+        "stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("粘贴对方的 REPLY："),
+        "stdout:\n{}",
+        out.stdout
+    );
+
+    let out = run(&[], "3\n");
+    assert_success(&out);
+    assert!(
+        out.stdout.trim_end().ends_with("已退出。"),
+        "stdout:\n{}",
         out.stdout
     );
 }
