@@ -2,7 +2,7 @@
 
 安全的 P2P TCP 端口转发（SSH / Web）：在本机 `127.0.0.1` 监听，经 SDK 配对与端到端加密的 QUIC 直连，转发到对端 `127.0.0.1` 的任意端口。
 
-> **状态：v0.1.3 已发布**。真机验证覆盖 macOS ↔ Windows、Termux ↔ Linux，以及 Windows ↔ Termux 跨网（两侧 NAT，显示「NAT 打洞」）。TUI/GUI 仍是占位 crate，v0.2/v0.3 交付。
+> **状态：v0.1.5 已发布**。真机验证覆盖 macOS ↔ Windows、Termux ↔ Linux，以及 Windows ↔ Termux 跨网（两侧 NAT，显示「NAT 打洞」）。TUI/GUI 仍是占位 crate，v0.2/v0.3 交付。
 > 哪些已验证、哪些没有，以 [docs/STATUS.md](docs/STATUS.md) 为准。
 
 ## 下载
@@ -11,21 +11,21 @@
 
 | 平台 | 发布资产 |
 | --- | --- |
-| Windows x86_64 | `p2p-tunnel-v0.1.3-windows-x86_64.exe` |
-| macOS Apple Silicon | `p2p-tunnel-v0.1.3-macos-aarch64` |
-| Linux x86_64（glibc） | `p2p-tunnel-v0.1.3-linux-x86_64-gnu` |
-| Linux aarch64（glibc） | `p2p-tunnel-v0.1.3-linux-aarch64-gnu` |
-| Linux x86_64（静态） | `p2p-tunnel-v0.1.3-linux-x86_64-musl` |
-| Linux aarch64（静态） | `p2p-tunnel-v0.1.3-linux-aarch64-musl` |
-| Android / Termux aarch64 | `p2p-tunnel-v0.1.3-android-aarch64` |
+| Windows x86_64 | `p2p-tunnel-v0.1.5-windows-x86_64.exe` |
+| macOS Apple Silicon | `p2p-tunnel-v0.1.5-macos-aarch64` |
+| Linux x86_64（glibc） | `p2p-tunnel-v0.1.5-linux-x86_64-gnu` |
+| Linux aarch64（glibc） | `p2p-tunnel-v0.1.5-linux-aarch64-gnu` |
+| Linux x86_64（静态） | `p2p-tunnel-v0.1.5-linux-x86_64-musl` |
+| Linux aarch64（静态） | `p2p-tunnel-v0.1.5-linux-aarch64-musl` |
+| Android / Termux aarch64 | `p2p-tunnel-v0.1.5-android-aarch64` |
 
 ```bash
 # Termux：Android 只接受 PIE + bionic，必须用 android 资产
-chmod +x p2p-tunnel-v0.1.3-android-aarch64
-./p2p-tunnel-v0.1.3-android-aarch64 --version
+chmod +x p2p-tunnel-v0.1.5-android-aarch64
+./p2p-tunnel-v0.1.5-android-aarch64 --version
 
 # macOS：ad-hoc 签名没有公证，首次运行前去掉 quarantine
-xattr -d com.apple.quarantine ./p2p-tunnel-v0.1.3-macos-aarch64
+xattr -d com.apple.quarantine ./p2p-tunnel-v0.1.5-macos-aarch64
 ```
 
 产物命名规则、校验和与 CI 细节见 [docs/ARTIFACTS.md](docs/ARTIFACTS.md)。
@@ -50,7 +50,7 @@ P2PR-INV2-...
 
 # B（加入方）
 $ target/release/p2p-tunnel
-> join
+> 2
 粘贴对方的 INVITE：
 P2PR-INV2-...        # 粘贴 A 的 INVITE，回车
 REPLY（通过可信渠道发给对方）：
@@ -88,11 +88,9 @@ ssh -p 2211 user@127.0.0.1
 | `status` | 显示链路、本机规则、对端规则、活动连接 |
 | `help` | 帮助 |
 | `quit` / `exit` | 优雅退出（等同 `Shutdown`；也可 Ctrl-C） |
-| `1` / `create` | 创建连接，生成 INVITE（`1` 仅配对前） |
-| `2` / `join` | 加入连接，粘贴对方 INVITE（`2` 仅配对前） |
-| `3` | `quit` 的菜单别名（仅配对前） |
+| `1` / `2` / `3` | 配对前菜单：创建 / 加入 / 退出（`create` / `join` 是同义文字写法） |
 
-数字 `1`/`2`/`3` 只在配对前有效；已连接后按未知命令处理。
+配对阶段（未连接）只接受 `1`/`2`/`3` 与 `create`/`join`；`add`/`close`/`status`/`help` 在连接建立前不接受。连接建立后 `1`/`2`/`3` 按未知命令处理，`create`/`join` 被拒绝。
 
 命令行参数只有 `--help` / `--version`；其余参数按用法错误处理，退出码 `2`。退出码约定：`0` 正常（含对端主动退出、链路断开 5 秒未恢复）、`1` 运行错误（含认证失败导致的会话丢失）、`2` 参数错误。
 

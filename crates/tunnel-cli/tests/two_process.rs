@@ -161,13 +161,13 @@ fn quit_ends_both_processes_with_exit_code_zero() {
     let mut b = Proc::spawn();
 
     // A 创建邀请。
-    a.send("create");
+    a.send("1");
     a.wait_for("INVITE（通过可信渠道发给对方）：", PAIR_TIMEOUT);
     let invite = a.wait_line_starting_with("P2PR-INV2-", PAIR_TIMEOUT);
     a.wait_for("粘贴对方的 REPLY：", PAIR_TIMEOUT);
 
     // B 粘贴邀请并取出回复。
-    b.send("join");
+    b.send("2");
     b.wait_for("粘贴对方的 INVITE：", PAIR_TIMEOUT);
     b.send(&invite);
     let reply = b.wait_line_starting_with("P2PR-REP2-", PAIR_TIMEOUT);
@@ -191,20 +191,45 @@ fn quit_ends_both_processes_with_exit_code_zero() {
     a.send("1");
     a.wait_for("未知命令：1", PAIR_TIMEOUT);
 
-    // 已连接后的帮助不再展示 create/join（这两个命令此时会被拒绝）。
+    a.send("3");
+    a.wait_for("未知命令：3", PAIR_TIMEOUT);
+
+    // 已连接后的帮助只列真实命令：不出现 create/join，也不出现数字别名。
     a.send("help");
     a.wait_for("配对已完成；要重新配对请退出后重新启动", PAIR_TIMEOUT);
     let text = a.text();
     let help_start = text
-        .find("配对已完成；要重新配对请退出后重新启动")
+        .rfind("p2p-tunnel — 安全的 P2P TCP 端口转发")
         .expect("帮助已打印");
     let help_tail = &text[help_start..];
+    assert!(
+        help_tail.contains("quit / exit"),
+        "help 应列出退出别名:\n{help_tail}"
+    );
+    assert!(
+        help_tail.contains("add <本机端口> <对端端口>"),
+        "help 应列 add 用法:\n{help_tail}"
+    );
     assert!(
         !help_tail.contains("create") && !help_tail.contains("join"),
         "已连接后的帮助不应展示配对命令\n帮助:\n{help_tail}"
     );
-    a.send("3");
-    a.wait_for("未知命令：3", PAIR_TIMEOUT);
+
+    // 已连接后命令校验与未知命令提示仍按预期工作。
+    a.send("add 0 22");
+    a.wait_for("[!] 端口必须是 1–65535", PAIR_TIMEOUT);
+    a.send("add 2211");
+    a.wait_for("[!] 用法：add <本机端口> <对端端口>", PAIR_TIMEOUT);
+    a.send("close 2211");
+    a.wait_for("[!] 没有本机规则监听 2211", PAIR_TIMEOUT);
+    a.send("frobnicate");
+    a.wait_for("[!] 未知命令：frobnicate", PAIR_TIMEOUT);
+    a.send("q");
+    a.wait_for("[!] 未知命令：q", PAIR_TIMEOUT);
+
+    // status 在已连接后可用。
+    a.send("status");
+    a.wait_for("本机规则:", PAIR_TIMEOUT);
 
     // A 退出：A 应退出 0，B 应打印「对端已退出」后退出 0。
     a.send("quit");

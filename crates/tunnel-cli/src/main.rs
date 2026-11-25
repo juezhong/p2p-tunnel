@@ -25,7 +25,7 @@ const STDIN_CHANNEL: usize = 64;
 
 const MENU: &str = "1) 创建连接   2) 加入连接   3) 退出";
 
-const HELP_COMMON: &str = "\
+const HELP: &str = "\
 p2p-tunnel — 安全的 P2P TCP 端口转发
 
 用法:
@@ -39,25 +39,13 @@ p2p-tunnel — 安全的 P2P TCP 端口转发
   status                     显示链路、本机规则、对端规则、活动连接
   help                       显示命令帮助
   quit / exit                优雅退出（也可用 Ctrl-C）
-";
-
-/// 配对前的帮助额外列出配对命令；已连接后 `create`/`join` 会被拒绝，不再展示。
-const HELP_PAIRING: &str = "\
-  create                     创建连接（生成 INVITE）
-  join                       加入连接（粘贴对方的 INVITE）
 
 说明:
   - 监听地址固定 127.0.0.1，目标固定为对端 127.0.0.1:<端口>。
   - 配对即信任：只和可信设备配对；配对后对端可访问本机任意 loopback 端口。
   - INVITE/REPLY 必须通过可信私密渠道交换。
-";
 
-const HELP_READY: &str = "\
-配对已完成；要重新配对请退出后重新启动。
-
-说明:
-  - 监听地址固定 127.0.0.1，目标固定为对端 127.0.0.1:<端口>。
-  - 配对即信任：配对后对端可访问本机任意 loopback 端口。
+配对阶段（未连接）只接受菜单 1/2/3；连接建立后才能使用上面的命令。
 ";
 
 fn main() -> ExitCode {
@@ -66,7 +54,7 @@ fn main() -> ExitCode {
         [] => {}
         [arg] if arg == "-h" || arg == "--help" => {
             let mut out = Output::new(io::stdout(), false);
-            out.block(HELP_COMMON.trim_end());
+            out.block(HELP.trim_end());
             return ExitCode::SUCCESS;
         }
         [arg] if arg == "-V" || arg == "--version" => {
@@ -244,16 +232,6 @@ async fn run() -> ExitCode {
     }
 }
 
-fn print_help<W: Write>(ui: &UiState, out: &mut Output<W>) {
-    if ui.ready_seen {
-        out.block(HELP_COMMON.trim_end());
-        out.block(HELP_READY.trim_end());
-    } else {
-        out.block(HELP_COMMON.trim_end());
-        out.block(HELP_PAIRING.trim_end());
-    }
-}
-
 /// 处理一行输入；返回 `false` 表示退出主循环。
 async fn handle_input<W: Write>(
     line: &str,
@@ -271,66 +249,57 @@ async fn handle_input<W: Write>(
     let mut parts = line.split_whitespace();
     let command = parts.next().unwrap_or("");
 
-    // 等待粘贴 INVITE/REPLY 时仍允许控制命令，避免用户被锁死在这一步。
-    // 合法配对码以 `P2PR-` 开头，不会与这些命令冲突。help/status/quit
-    // 只在这里匹配一次，下面的普通命令分支不再重复。
-    // `exit` 与 `quit` 等价；单字符 `q`/`?` 不是别名，保持未知命令。
-    // `3` 只在配对前作为菜单快捷退出；配对后 CLI 里数字一律不支持。
+    // `exit` 与 `quit` 等价；单字符 `q`/`?` 不是别名。
+    // `3` 只在配对前作为菜单退出；配对后数字一律不支持。
     if matches!(command, "quit" | "exit") || (command == "3" && !ui.ready_seen) {
         return false;
     }
-    if command == "help" {
-        print_help(ui, out);
-        return true;
-    }
-    if command == "status" {
-        print_status(ui, out);
+
+    // 配对阶段（未连接）是模态的：只能选择 1/2/3，或粘贴合法配对码。
+    // `add`/`close`/`status`/`help` 等命令在连接建立前不接受。
+    if !ui.ready_seen {
+        if ui.awaiting != Awaiting::None {
+            // 只有 `P2PR-` 开头的配对码才送出；命令不会被误当配对码，
+            // 避免 `add` 之类的输入触发一次失败配对（v0.1.3 真机缺陷）。
+            if !line.starts_with("P2PR-") {
+                out.line("[!] 无效的配对码：应以 P2PR- 开头；输入 quit 退出");
+                return true;
+            }
+            match std::mem::replace(&mut ui.awaiting, Awaiting::None) {
+                Awaiting::Reply => {
+                    send(commands, Command::ProvideReply(line.to_string()), out).await
+                }
+                Awaiting::Invite => {
+                    send(commands, Command::JoinInvite(line.to_string()), out).await
+                }
+                Awaiting::None => unreachable!("上面已确认存在等待状态"),
+            }
+            return true;
+        }
+        match command {
+            "1" | "create" => send(commands, Command::CreateInvite, out).await,
+            "2" | "join" => {
+                ui.awaiting = Awaiting::Invite;
+                out.line("粘贴对方的 INVITE：");
+            }
+            _ => {
+                out.line("[!] 尚未连接：配对阶段只能输入 1/2（创建/加入）或 3（退出）");
+            }
+        }
         return true;
     }
 
-    if ui.awaiting != Awaiting::None {
-        // 只有 `P2PR-` 开头的配对码才送出；命令不会被误当配对码，
-        // 避免 `add` 之类的输入触发一次失败配对（v0.1.3 真机缺陷）。
-        if !line.starts_with("P2PR-") {
-            out.line("[!] 无效的配对码：应以 P2PR- 开头；输入 quit 退出");
-            return true;
-        }
-        match std::mem::replace(&mut ui.awaiting, Awaiting::None) {
-            Awaiting::Reply => send(commands, Command::ProvideReply(line.to_string()), out).await,
-            Awaiting::Invite => send(commands, Command::JoinInvite(line.to_string()), out).await,
-            Awaiting::None => unreachable!("上面已确认存在等待状态"),
-        }
-        return true;
-    }
     match command {
-        // 数字菜单只在配对前有效（启动菜单）；配对完成后数字一律不支持。
-        "1" | "create" => {
-            if ui.ready_seen {
-                let message = if command == "1" {
-                    "[!] 未知命令：1（输入 help 查看帮助）"
-                } else {
-                    PAIR_WHILE_CONNECTED
-                };
-                out.line(message);
-                return true;
-            }
-            send(commands, Command::CreateInvite, out).await;
-        }
-        "2" | "join" => {
-            if ui.ready_seen {
-                let message = if command == "2" {
-                    "[!] 未知命令：2（输入 help 查看帮助）"
-                } else {
-                    PAIR_WHILE_CONNECTED
-                };
-                out.line(message);
-                return true;
-            }
-            ui.awaiting = Awaiting::Invite;
-            out.line("粘贴对方的 INVITE：");
-        }
         "add" => handle_add(parts.collect(), commands, ui, out).await,
         "close" => handle_close(parts.collect(), commands, ui, out).await,
+        "status" => print_status(ui, out),
+        "help" => {
+            out.block(HELP.trim_end());
+            out.line("配对已完成；要重新配对请退出后重新启动。");
+        }
+        // 已连接后 `create`/`join` 没有意义（单对端会话）。
+        "create" | "join" => out.line(PAIR_WHILE_CONNECTED),
+        // 数字菜单只在配对前有效；这里的 1/2/3 一律未知命令。
         other => {
             out.line(&format!("[!] 未知命令：{other}（输入 help 查看帮助）"));
         }
@@ -734,12 +703,28 @@ mod tests {
     #[tokio::test]
     async fn single_char_aliases_remain_unknown_commands() {
         let (tx, mut rx) = mpsc::channel(4);
+
+        // 配对阶段是模态的：q/? 不产生 core 命令，只提示只能输入 1/2/3。
         let mut ui = UiState::default();
         let mut out = Output::new(Vec::new(), false);
-        // 只有 `quit`/`exit`/菜单 `3` 是退出写法；单字符 `q`/`?` 仍是未知命令。
         for alias in ["q", "?"] {
             assert!(handle_input(alias, &tx, &mut ui, &mut out).await);
             assert!(rx.try_recv().is_err(), "未知命令不应产生 core 命令");
+        }
+        let text = String::from_utf8(out.into_writer()).expect("输出应为 UTF-8");
+        assert!(
+            text.contains("配对阶段只能输入 1/2（创建/加入）或 3（退出）"),
+            "{text}"
+        );
+
+        // 已连接后 q/? 仍是未知命令，不是退出别名。
+        let mut ui = UiState {
+            ready_seen: true,
+            ..UiState::default()
+        };
+        let mut out = Output::new(Vec::new(), false);
+        for alias in ["q", "?"] {
+            assert!(handle_input(alias, &tx, &mut ui, &mut out).await);
         }
         let text = String::from_utf8(out.into_writer()).expect("输出应为 UTF-8");
         assert!(
