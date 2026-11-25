@@ -139,6 +139,7 @@ impl Session {
         let worker = tokio::spawn(async move {
             Worker {
                 link,
+                paired: false,
                 events: event_tx,
                 rules: HashMap::new(),
                 peer_rules: HashMap::new(),
@@ -261,6 +262,8 @@ impl TaskRegistry {
 /// actor 内部状态；所有可变状态只在 worker task 内访问。
 struct Worker {
     link: Option<Arc<dyn DataLink>>,
+    /// 已成功配对（`PairingEvent::Connected` 之后为真；Stop/退出后为假）。
+    paired: bool,
     events: mpsc::Sender<Event>,
     rules: HashMap<u16, LocalRule>,
     /// 最近一次收到的对端规则（全量快照），用于回推 `RemoteClosed`。
@@ -583,6 +586,16 @@ impl Worker {
     }
 
     async fn handle_command(&mut self, command: Command) {
+        // v0.1 单对端（SPEC §7.2）：已连接后不允许再发起配对，保持现有会话。
+        if self.paired && matches!(command, Command::CreateInvite | Command::JoinInvite(_)) {
+            let _ = self
+                .events
+                .send(Event::Error(TunnelError::Pairing(
+                    "已连接，不能再次配对；请先退出后重新启动".into(),
+                )))
+                .await;
+            return;
+        }
         match command {
             Command::Shutdown => {}
             // v0.1 CLI 不使用；TUI/GUI 用它停掉转发但保留进程与 core。
@@ -646,6 +659,7 @@ impl Worker {
                 let _ = self.events.send(Event::ComparisonCode(code)).await;
             }
             PairingEvent::Connected(connected) => {
+                self.paired = true;
                 self.link_state = Some(connected.link.subscribe_link_state());
                 self.link = Some(connected.link);
                 self.bootstrap_outbound = connected.bootstrap_outbound;
@@ -873,6 +887,7 @@ impl Worker {
         self.updates = None;
         // 释放数据链路：drop 会让 SDK managed link 的 worker 停止。
         self.link = None;
+        self.paired = false;
         self.link_state = None;
         self.reconnecting_since = None;
         self.reconnect_deadline = None;
@@ -918,6 +933,7 @@ impl Worker {
     /// worker 停止），停止配对任务并释放 SDK peer。
     async fn release_session(&mut self) {
         self.link = None;
+        self.paired = false;
         if let Some(commands) = self.pairing_commands.take() {
             let _ = commands.send(PairingCommand::Stop).await;
         }
@@ -1341,6 +1357,7 @@ mod tests {
         let (link_lost, _) = watch::channel(0u64);
         let mut worker = Worker {
             link: None,
+            paired: false,
             events: event_tx,
             rules: HashMap::new(),
             peer_rules: HashMap::new(),
@@ -1448,6 +1465,50 @@ mod tests {
             other => panic!("期望 ComparisonCode，实际 {other:?}"),
         };
         assert_eq!(comparison, "123456");
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pairing_is_rejected_after_ready_and_session_stays_up() {
+        let mut session = Session::spawn_with_pairing(Box::new(MockPairing::new()));
+        session
+            .sender()
+            .send(Command::ConfirmComparison)
+            .await
+            .expect("channel open");
+        next_matching(&mut session, |event| matches!(event, Event::Ready)).await;
+
+        session
+            .sender()
+            .send(Command::CreateInvite)
+            .await
+            .expect("channel open");
+        let rejected = next_matching(&mut session, |event| matches!(event, Event::Error(_))).await;
+        match rejected {
+            Event::Error(TunnelError::Pairing(message)) => {
+                assert!(message.contains("已连接"), "实际提示：{message}");
+            }
+            other => panic!("期望 Error(Pairing)，实际 {other:?}"),
+        }
+
+        // 现有会话不受影响：仍可新增转发。
+        let listen_port = free_port();
+        session
+            .sender()
+            .send(Command::AddForward(Forward {
+                listen_port,
+                peer_port: 22,
+            }))
+            .await
+            .expect("channel open");
+        let started = next_matching(&mut session, |event| {
+            matches!(event, Event::ListenerStarted(_))
+        })
+        .await;
+        match started {
+            Event::ListenerStarted(port) => assert_eq!(port, listen_port),
+            other => panic!("期望 ListenerStarted，实际 {other:?}"),
+        }
         session.shutdown().await;
     }
 

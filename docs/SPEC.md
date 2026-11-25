@@ -389,6 +389,7 @@ pub enum Event {
 
 - INVITE/REPLY 必须通过可信私密渠道交换；比较码只用于可选人工核对，v0.1 不阻塞。
 - 配对超时/失败 → `Event::Error(TunnelError::Pairing)`；不自动重试配对。
+- v0.1 是单对端：`Event::Ready` 后 `CreateInvite`/`JoinInvite` 一律返回 `Event::Error(TunnelError::Pairing)`（「已连接，不能再次配对」），现有会话、规则与活动连接不受影响；更换对端需退出进程后重新配对。
 - 配对成功后，core 立即 `manage_link()`，等数据链路 `Connected`，再允许 `AddForward` 启动 listener。
 
 ### 7.3 会话生命周期
