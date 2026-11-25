@@ -6,7 +6,7 @@
 
 - CLI 已发布 v0.1.0–v0.1.3；配对、动态多规则、双向 TCP 转发、Farewell 告别、5 秒断开退出、配对路径摘要、单对端限制均已实现并有测试。
 - 真机验证：macOS ↔ Windows、Termux ↔ Linux、Windows ↔ Termux 跨网（两侧 NAT，显示「NAT 打洞」）。
-- 实现票 `01`–`18`（含伞票 `11`/`13`）全部关闭，归档在工作区 `.scratch/p2p-tunnel-v0/archive/issues/`。
+- 实现票 `01`–`19`（含伞票 `11`/`13`）全部关闭，归档在工作区 `.scratch/p2p-tunnel-v0/archive/issues/`。
 - TUI/GUI 仍是占位 crate；下一步从 `.scratch/p2p-tunnel-v0/map.md` 的 Not yet specified 拆票。
 
 ## 工作区环境

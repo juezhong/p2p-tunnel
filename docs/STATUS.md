@@ -1,6 +1,6 @@
 # p2p-tunnel 状态交接
 
-> 2026-10-09 初始建档；2026-11-24 v0.1 CLI 完成；2026-11-25 真机跨平台联调通过并发布 v0.1.0；同日 ticket 14–17（CLI 输出层与 exit、日志分流、会话告别、告别/断链边界）全部实现，两轴审阅修复后合并 `main`（4 个按票提交，`a89e391`）；随后发布 v0.1.1（Windows 告别用例超时修复 `3d9b268`）；v0.1.2 增加连接路径类别摘要（不含地址）；v0.1.3 修复已连接后仍可再次配对的问题（票据 18）。Windows ↔ Termux 跨网配对与 SSH 转发真机通过。以最新源码、分支、CI 与手工记录为准，不要只凭本文。
+> 2026-10-09 初始建档；2026-11-24 v0.1 CLI 完成；2026-11-25 真机跨平台联调通过并发布 v0.1.0；同日 ticket 14–17（CLI 输出层与 exit、日志分流、会话告别、告别/断链边界）全部实现，两轴审阅修复后合并 `main`（4 个按票提交，`a89e391`）；随后发布 v0.1.1（Windows 告别用例超时修复 `3d9b268`）；v0.1.2 增加连接路径类别摘要（不含地址）；v0.1.3 修复已连接后仍可再次配对的问题（票据 18）；票据 19 把 CLI 双进程端到端纳入自动化（`crates/tunnel-cli/tests/two_process.rs`，全量 153 tests）。Windows ↔ Termux 跨网配对与 SSH 转发真机通过。以最新源码、分支、CI 与手工记录为准，不要只凭本文。
 
 ## 2026-11-25：v0.1.0 发布与真机联调
 
@@ -56,7 +56,7 @@
 - 退出顺序按 SPEC §9.5 改为：停 listener → reset 活动连接并等 bridge 收尾 → 发 `Farewell`（仅本端主动退出）→ 释放数据链路与 SDK peer；`Farewell` 不再在 listener 仍可接新连接时发送。
 - 结束路径抑制后续链路事件：对端 `Farewell` 或断开判定后不再发 `LinkState(Reconnecting)`/断开计时事件；`session_lost()` 更名为 `end_session()`，修复断链分支未置位结束标记的问题。
 - `Farewell` 编解码统一走 `RuleFrame::farewell_frame()`/`decode_farewell()`，删除 `rule_sync` 手工读 2 字节与 `session` 手工拼帧头。
-- 已知缺口只做文档化：Windows 无 console 输入实现（tty 清行重绘仅 unix）；CLI 双进程端到端未自动化（见下“未验证”）。
+- 已知缺口只做文档化：Windows 无 console 输入实现（tty 清行重绘仅 unix）；CLI 双进程端到端当时未自动化，已由票据 19 补齐（见「已验证」）。
 - 证据：`cargo test --workspace` 151 passed；新增 `peer_farewell_suppresses_reconnecting_after_end`。
 
 ## 2026-11-24：v0.1 CLI 完成（ticket 10）
@@ -87,13 +87,13 @@
 
 | 项目 | 证据 |
 | --- | --- |
-| GitHub Actions | run [45526832293](https://github.com/juezhong/p2p-tunnel/actions/runs/45526832293)（head `8350741`）全绿：2 个 `test` job + 7 个 `build binaries` job。 |
+| GitHub Actions | 最新 run [45588223603](https://github.com/juezhong/p2p-tunnel/actions/runs/45588223603)（head `c1f4779`，2026-11-25）全绿：Linux `test`（fmt + clippy + test）与 Windows `test` 两个 job；此前 run 45586061699 同绿。 |
 | 测试分流 | Linux job 跑 fmt + clippy + test + UI 边界守卫；Windows job 只跑 test。 |
 | 交叉构建 | Linux aarch64-gnu / x86_64-musl / aarch64-musl 用 `houseabsolute/actions-rust-cross`；aarch64-musl 冒烟经 `docker/setup-qemu-action` 真实执行二进制。 |
 | Android | NDK r28 构建 `aarch64-linux-android`；冒烟校验 PIE 成功，二进制无 TLS 段（`tls=none`），不受 arm64 TLS 对齐限制。 |
 | macOS | `macos-15` 原生构建 + ad-hoc `codesign`；Gatekeeper quarantine 需用户手动去掉。 |
 | 产物 | 7 个 artifact：linux-x86_64-gnu / linux-aarch64-gnu / linux-x86_64-musl / linux-aarch64-musl / windows-x86_64 / macos-aarch64 / android-aarch64，均含二进制与 `SHA256SUMS`。 |
-| 发布 | tag `v0.1.0`（commit `a4ee6b6`）已发布 [Release](https://github.com/juezhong/p2p-tunnel/releases/tag/v0.1.0)：7 个带平台名的二进制 + `SHA256SUMS`；run [45559849832](https://github.com/juezhong/p2p-tunnel/actions/runs/45559849832) 全绿。 |
+| 发布 | tag `v0.1.0`–`v0.1.3` 均已发布：v0.1.0（`a4ee6b6`，[run 45559849832](https://github.com/juezhong/p2p-tunnel/actions/runs/45559849832)）、v0.1.1（`dd4252d`）、v0.1.2（`cbd7a9f`）、v0.1.3（`2412267`，最新）。每个 Release 含 7 个平台二进制 + `SHA256SUMS`。 |
 
 ### 未验证（不要引用为已完成）
 

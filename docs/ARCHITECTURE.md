@@ -71,7 +71,7 @@ stdin 线程 ──InputEvent──▶ CLI select! ──Command──▶ Sessio
 - 等待粘贴 INVITE/REPLY 时仍接受 `help`/`status`/`quit`，避免交互死锁；其余整行按配对码发送。
 - stdin 读取线程通过**有界**通道（容量 64）把 `InputEvent` 交给主循环：tty 下逐字节（供行编辑与提示符重绘），非 tty 下整行；通道满时读线程阻塞，主循环卡住时不会把输入堆进内存。
 - 所有用户可见输出经输出层：tty（unix raw mode）下清行、重绘 `> ` 与未提交输入；非 tty 只发普通换行，不发光标控制。清行重绘仅 unix 支持，Windows 走行模式（SPEC §8.5）。
-- `status` 按 SPEC §8.3 输出四段：链路（连接时含 `managed link`）、本机规则（`监听中` + 连接数）、对端规则（`B:<port> -> 本机:<port>`）、逐条活动连接（`本机:<port> 的连接 -> 对端:<port>`）。
+- `status` 按 SPEC §8.3 输出四段：链路（连接时含 `managed link`）、本机规则（`监听中` + 连接数）、对端规则（`对端:<port> -> 本机:<port>`）、逐条活动连接（`本机:<port> 的连接 -> 对端:<port>`）。
 - 状态全部来自 core 事件：未配对显示「未连接」，重连显示「链路: 重连中」并标注对端规则可能过期，规则同步流不可用时标注「规则未知」。
 - `close` 成功的 `[-] <port> 已关闭（活动连接已重置）` 在 core 的 `RulesChanged` 到达后才打印；失败会回滚并显示 `[!]` 错误。
 - 退出路径（`quit`/`exit`/菜单 `3`/Ctrl-C/EOF）统一发送 `Shutdown`，先排空已产生事件再等 core 清理，总上限 5 秒。
@@ -88,7 +88,6 @@ stdin 线程 ──InputEvent──▶ CLI select! ──Command──▶ Sessio
 ## 与规格的关系
 
 `docs/SPEC.md` 是实现规格（协议、状态机、CLI 文案、验收 gate），改动实现前先读对应章节。
-ticket 10 任务描述里写的 “SPEC §7.7” 在 `SPEC.md` 中不存在；CLI 文案的实际来源是 §8。
 
 ### 有意的 API 扩展
 
