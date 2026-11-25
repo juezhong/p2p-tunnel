@@ -1,6 +1,6 @@
 # p2p-tunnel v0.1 开发规格
 
-> 状态：**已实现（v0.1.3）**；本文是行为规格，实现改动先改本文再改代码
+> 状态：**已实现（v0.1.4）**；本文是行为规格，实现改动先改本文再改代码
 > 日期：2026-11-25
 > 上游决策：工作区 `.scratch/p2p-tunnel-v0/map.md`（wayfinder，已关闭）
 > 关键决策票：001–014；实现研究：工作区 `.scratch/p2p-tunnel-v0/research/009-sdk-baseline.md`、`.scratch/p2p-tunnel-v0/research/013-quinn-tcp-bridge.md`
@@ -506,11 +506,14 @@ pub trait TunnelWrite: AsyncWrite + Send + Unpin {
 
 ```text
 $ p2p-tunnel
-1) 创建连接   2) 加入连接   3) 退出
+p2p-tunnel v0.1.4 — 安全的 P2P TCP 端口转发
+输入 create 创建连接，join 加入连接；help 查看命令，quit 退出。
+>
 ```
 
-- 创建：打印 INVITE，等待用户粘贴 REPLY。
-- 加入：提示粘贴 INVITE，打印 REPLY。
+- 创建：输入 `create`，打印 INVITE，等待用户粘贴 REPLY。
+- 加入：输入 `join`，提示粘贴 INVITE，打印 REPLY。
+- 不接受数字菜单别名（`1` / `2` / `3` 都是未知命令）；菜单只列文字命令，避免"数字看起来像选项"。
 - 配对后打印比较码（信息性），不要求输入确认；自动进入命令模式。
 - 不提供 `--listen`/`--target` 启动参数；规则用命令动态加。
 - 支持 `--help` / `--version`；不支持配置文件。
@@ -525,8 +528,12 @@ $ p2p-tunnel
 | `help` | 帮助 |
 | `quit` | 优雅退出（等同 `Shutdown`） |
 | `exit` | `quit` 的别名，行为完全相同 |
+| `create` | 创建连接（生成 INVITE） |
+| `join` | 加入连接（粘贴对方的 INVITE） |
 
-菜单 `3` 与 `quit` / `exit` 等价；单字符 `q`、`?` 不是别名，按未知命令处理。
+- 数字菜单别名（`1` / `2` / `3`）已移除；单字符 `q`、`?` 也不是别名，按未知命令处理。
+- 已连接（`Ready` 之后）再输入 `create` / `join` 被拒绝，提示「已连接，不能再次配对；请先退出后重新启动」，现有会话、规则与活动连接不受影响（§7.2 单对端）。
+- 等待粘贴 INVITE/REPLY 时，除 `quit`/`exit`/`help`/`status` 外，不以 `P2PR-` 开头的输入按「无效配对码」拒绝，**不会**把命令误当配对码送出；继续留在等待状态。
 
 ### 8.3 示例
 

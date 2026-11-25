@@ -161,13 +161,13 @@ fn quit_ends_both_processes_with_exit_code_zero() {
     let mut b = Proc::spawn();
 
     // A 创建邀请。
-    a.send("1");
+    a.send("create");
     a.wait_for("INVITE（通过可信渠道发给对方）：", PAIR_TIMEOUT);
     let invite = a.wait_line_starting_with("P2PR-INV2-", PAIR_TIMEOUT);
     a.wait_for("粘贴对方的 REPLY：", PAIR_TIMEOUT);
 
     // B 粘贴邀请并取出回复。
-    b.send("2");
+    b.send("join");
     b.wait_for("粘贴对方的 INVITE：", PAIR_TIMEOUT);
     b.send(&invite);
     let reply = b.wait_line_starting_with("P2PR-REP2-", PAIR_TIMEOUT);
@@ -184,6 +184,12 @@ fn quit_ends_both_processes_with_exit_code_zero() {
         &format!("127.0.0.1:{listen_port} -> 对端:9 监听中"),
         PAIR_TIMEOUT,
     );
+
+    // 已连接后再次发起配对应被拒绝，且不影响现有会话。
+    a.send("create");
+    a.wait_for("[!] 已连接，不能再次配对", PAIR_TIMEOUT);
+    a.send("1");
+    a.wait_for("未知命令：1", PAIR_TIMEOUT);
 
     // A 退出：A 应退出 0，B 应打印「对端已退出」后退出 0。
     a.send("quit");

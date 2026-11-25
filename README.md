@@ -42,15 +42,15 @@ cargo build --release -p tunnel-cli
 ```text
 # A（创建方）
 $ target/release/p2p-tunnel
-1) 创建连接   2) 加入连接   3) 退出
-> 1
+输入 create 创建连接，join 加入连接；help 查看命令，quit 退出。
+> create
 INVITE（通过可信渠道发给对方）：
 P2PR-INV2-...
 粘贴对方的 REPLY：
 
 # B（加入方）
 $ target/release/p2p-tunnel
-> 2
+> join
 粘贴对方的 INVITE：
 P2PR-INV2-...        # 粘贴 A 的 INVITE，回车
 REPLY（通过可信渠道发给对方）：

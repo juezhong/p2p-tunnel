@@ -193,7 +193,7 @@ fn quit_exits_zero_and_prints_goodbye() {
     );
 }
 
-const MENU_LINE: &str = "1) 创建连接   2) 加入连接   3) 退出";
+const MENU_LINE: &str = "输入 create 创建连接，join 加入连接；help 查看命令，quit 退出。";
 
 #[test]
 fn status_shows_required_sections_in_order() {
@@ -338,8 +338,8 @@ fn unset_rust_log_keeps_warn_on_stderr_only() {
     let out = run_with_steps(
         &[],
         &[
-            ("2\n", Duration::from_millis(300)),
-            ("bogus-invite\n", Duration::from_millis(1200)),
+            ("join\n", Duration::from_millis(300)),
+            ("P2PR-bogus-invite\n", Duration::from_millis(1200)),
             ("quit\n", Duration::ZERO),
         ],
         None,
@@ -436,14 +436,36 @@ fn exit_alias_exits_zero_and_prints_goodbye() {
 }
 
 #[test]
-fn menu_three_still_exits() {
-    let out = run(&[], "3\n");
+fn numeric_menu_aliases_are_unknown_commands() {
+    // 数字看起来像选项，容易在已连接后误触发配对；统一按未知命令处理。
+    let out = run(&[], "1\n2\n3\nquit\n");
+    assert_success(&out);
+    for number in ["1", "2", "3"] {
+        assert!(
+            out.stdout.contains(&format!("未知命令：{number}")),
+            "stdout:\n{}",
+            out.stdout
+        );
+    }
+    assert!(
+        !out.stdout.contains("配对失败"),
+        "数字不应触发配对\nstdout:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn awaiting_invite_rejects_commands_instead_of_pairing() {
+    // v0.1.3 缺陷：等待 INVITE 时输入 `add ...` 被当作配对码送出，报了
+    // 一次莫名其妙的「配对失败」，且命令本身没有执行。
+    let out = run(&[], "join\nadd 8080 8080\nquit\n");
     assert_success(&out);
     assert!(
-        out.stdout.trim_end().ends_with("已退出。"),
+        out.stdout.contains("无效的配对码"),
         "stdout:\n{}",
         out.stdout
     );
+    assert!(!out.stdout.contains("配对失败"), "stdout:\n{}", out.stdout);
 }
 
 #[test]

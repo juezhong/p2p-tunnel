@@ -23,7 +23,7 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 /// stdin 行通道容量：有界，读线程在通道满时阻塞（背压），不会无界增长。
 const STDIN_CHANNEL: usize = 64;
 
-const MENU: &str = "1) 创建连接   2) 加入连接   3) 退出";
+const MENU: &str = "输入 create 创建连接，join 加入连接；help 查看命令，quit 退出。";
 
 const HELP: &str = "\
 p2p-tunnel — 安全的 P2P TCP 端口转发
@@ -39,8 +39,8 @@ p2p-tunnel — 安全的 P2P TCP 端口转发
   status                     显示链路、本机规则、对端规则、活动连接
   help                       显示命令帮助
   quit / exit                优雅退出（也可用 Ctrl-C）
-  1 / create                 创建连接（生成 INVITE）
-  2 / join                   加入连接（粘贴对方的 INVITE）
+  create                     创建连接（生成 INVITE）
+  join                       加入连接（粘贴对方的 INVITE）
 
 说明:
   - 监听地址固定 127.0.0.1，目标固定为对端 127.0.0.1:<端口>。
@@ -253,7 +253,7 @@ async fn handle_input<W: Write>(
     // 合法配对码以 `P2PR-` 开头，不会与这些命令冲突。help/status/quit
     // 只在这里匹配一次，下面的普通命令分支不再重复。
     // `exit` 与 `quit` 等价；单字符 `q`/`?` 不是别名，保持未知命令。
-    if matches!(command, "3" | "quit" | "exit") {
+    if matches!(command, "quit" | "exit") {
         return false;
     }
     if command == "help" {
@@ -266,7 +266,12 @@ async fn handle_input<W: Write>(
     }
 
     if ui.awaiting != Awaiting::None {
-        // 其余整行都当作配对码，成功送出后退出等待状态。
+        // 只有 `P2PR-` 开头的配对码才送出；命令不会被误当配对码，
+        // 避免 `add` 之类的输入触发一次失败配对（v0.1.3 真机缺陷）。
+        if !line.starts_with("P2PR-") {
+            out.line("[!] 无效的配对码：应以 P2PR- 开头；输入 quit 退出");
+            return true;
+        }
         match std::mem::replace(&mut ui.awaiting, Awaiting::None) {
             Awaiting::Reply => send(commands, Command::ProvideReply(line.to_string()), out).await,
             Awaiting::Invite => send(commands, Command::JoinInvite(line.to_string()), out).await,
@@ -275,10 +280,18 @@ async fn handle_input<W: Write>(
         return true;
     }
     match command {
-        "1" | "create" => {
+        "create" => {
+            if ui.ready_seen {
+                out.line(PAIR_WHILE_CONNECTED);
+                return true;
+            }
             send(commands, Command::CreateInvite, out).await;
         }
-        "2" | "join" => {
+        "join" => {
+            if ui.ready_seen {
+                out.line(PAIR_WHILE_CONNECTED);
+                return true;
+            }
             ui.awaiting = Awaiting::Invite;
             out.line("粘贴对方的 INVITE：");
         }
@@ -569,6 +582,9 @@ async fn send<W: Write>(commands: &mpsc::Sender<Command>, command: Command, out:
         out.line("[!] core 已退出");
     }
 }
+
+/// 已连接时再次发起配对的统一文案（`docs/SPEC.md` §8.2）。
+const PAIR_WHILE_CONNECTED: &str = "[!] 已连接，不能再次配对；请先退出后重新启动";
 
 /// 等待用户粘贴配对码的交互状态。
 #[derive(Default, PartialEq, Eq)]
