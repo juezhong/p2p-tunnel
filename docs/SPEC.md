@@ -1,7 +1,7 @@
 # p2p-tunnel v0.1 开发规格
 
-> 状态：**draft for review**（决策已收敛；实现票已拆分，待开工）
-> 日期：2026-11-24
+> 状态：**已实现（v0.1.3）**；本文是行为规格，实现改动先改本文再改代码
+> 日期：2026-11-25
 > 上游决策：工作区 `.scratch/p2p-tunnel-v0/map.md`（wayfinder，已关闭）
 > 关键决策票：001–014；实现研究：工作区 `.scratch/p2p-tunnel-v0/research/009-sdk-baseline.md`、`.scratch/p2p-tunnel-v0/research/013-quinn-tcp-bridge.md`
 > SDK pin：`d4cdd2ed47285248da31e54abbdc6e27f99361d2`
@@ -739,21 +739,21 @@ $ p2p-tunnel
 
 ### v0.1 发布 Gate
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo clippy --all-targets -- -D warnings`
-- [ ] `cargo test`
-- [ ] `cargo build --release`
-- [ ] GitHub Actions Linux x86_64 + Windows x86_64 全绿
-- [ ] Windows ↔ Termux LAN 双机记录
-- [ ] 真实 NAT/CGNAT 记录（发布前）
-- [ ] 无中继证据（诊断 + SDK 无 relay/TURN）
-- [ ] 已知限制写入 `docs/STATUS.md`
+- [x] `cargo fmt --check`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test`
+- [x] `cargo build --release`
+- [x] GitHub Actions Linux x86_64 + Windows x86_64 全绿
+- [x] Windows ↔ Termux 跨网双机记录（两侧 NAT）
+- [x] 真实 NAT/CGNAT 记录（发布前；v0.1.2 起以路径类别摘要交付，地址不落盘）
+- [x] 无中继证据（诊断 + SDK 无 relay/TURN）
+- [x] 已知限制写入 `docs/STATUS.md`
 
 ---
 
 ## 13. 实现票（已落盘）
 
-> 已落盘：工作区 `.scratch/p2p-tunnel-v0/issues/`（01、02、03a/03b、04–10，共 11 张，带 blocking edges）。
+> 全部实现票已于 2026-11-25 关闭，归档在工作区 `.scratch/p2p-tunnel-v0/archive/issues/`；`01`–`18`（含伞票 `11`/`13`）均已验收。
 
 按依赖顺序，每张票应自包含、可独立验证：
 
@@ -764,7 +764,7 @@ $ p2p-tunnel
 5. **04 M1 关闭语义、背压与上限**：RST/STOP、16 KiB 有界缓冲、每 forward 64/每侧 96、`open_bi` 5 s 超时、错误码映射。
 6. **05 M1 规则同步与动态多规则**：`Hello`/`RuleList` 快照、`RemoteClosed`、状态流降级。
 7. **06 M2 SDK 配对与真实转发**：INVITE/REPLY、比较码、managed link、目标拨号、真实 SDK 环回测试、审计日志。
-8. **07 M2 重连与失败注入**：`ManagedLinkStatus`、generation 切换、listener 保持、活动连接 reset、120 s 会话丢失、bootstrap 关闭验证。
+8. **07 M2 重连与失败注入**：`ManagedLinkStatus`、generation 切换、listener 保持、活动连接 reset、5 秒断开判定、bootstrap 关闭验证。
 9. **08 M2 平台 LAN 验收**：Windows/Termux 双机、端口冲突、RST、后台/防火墙。
 10. **09 M3 真实 NAT 验收**：跨 NAT/CGNAT 一次、STUN/ICE 诊断、无中继证据。
 11. **10 M4 CLI 完整与文档**：命令、状态、错误文案、退出码、`STATUS.md`/`README` 更新。

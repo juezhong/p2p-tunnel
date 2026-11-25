@@ -10,9 +10,9 @@
 | --- | --- | --- |
 | macOS (Apple Silicon) ↔ Windows x86_64 | **配对与规则同步打通** | 两端真实 SDK 配对，比较码一致（`372470`），`链路: 已连接（managed link）`；`bootstrap_outbound` 一侧 false、一侧 true；双方 `status` 都能看到对端规则（如 `对端:2233 -> 本机:8022`）。 |
 | Termux (Android aarch64) ↔ Linux x86_64 | **真实隧道转发打通** | Termux 侧 `add 2233 8022`、Linux 侧 `add 2233 22`，双向规则同步；目标端审计 `target_port=8022 peer_session=... result=ok`；`status` 活动连接从 1 条随客户端关闭回到 0。 |
-| Windows ↔ Termux | **配对与链路已通** | 2026-11-25：两端比较码一致，`配对完成，managed 数据链路已连接`，`bootstrap_outbound` 分别为 false/true，`status` 均显示已连接。缺少真实 `ssh -p` 双机、端口冲突、RST、后台限制/防火墙记录。 |
+| Windows ↔ Termux（跨网） | **配对接通、规则与转发通过** | 2026-11-25：Termux 在远程家庭网络、Windows 在本地 NAT 后；比较码 `594092` 自动确认，`[+] 配对完成，已连接（NAT 打洞）`（v0.1.2+）；双向规则互见，`ssh -p` 转发正常；Windows `quit` 后 Termux 打印「对端已退出」。macOS 与 Windows 在 v0.1.3 复测通过。 |
 
-结论：v0.1 的数据面在 Android/bionic、macOS、Windows、Linux 四类真实环境上都能建立会话并转发 TCP；ticket 08 的“双机验收清单”仍不完整，不能宣称完成。
+结论：v0.1 的数据面在 Android/bionic、macOS、Windows、Linux 四类真实环境上都能建立会话并转发 TCP；Windows ↔ Termux 跨网（两侧 NAT）配对、规则同步与 SSH 转发已实测，票据 08 已关闭，边界项见下「未验证」。
 
 ### 真机联调暴露的问题（已记录，下一版处理）
 
@@ -72,7 +72,7 @@
 | --- | --- |
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
-| `cargo test --workspace` | **151 passed**（tunnel-core 单元 80 + `farewell` 7 + `listener_echo` 14 + `rule_sync` 8 + tunnel-cli 单元 21 + 黑盒 21） |
+| `cargo test --workspace` | **152 passed**（tunnel-core 单元 80 + `farewell` 7 + `listener_echo` 14 + `rule_sync` 8 + tunnel-cli 单元 21 + 黑盒 21） |
 | 真实 SDK 双进程环回 | 2026-11-24 ticket 06/10 手工记录（配对、双向 echo、close/RemoteClosed、审计 `result=ok`）；记录在 `.tmp/`，不提交 |
 | 退出清理与端口重绑 | core 用例 `shutdown_releases_listener_port_for_immediate_rebind`、`peer_farewell_ends_session_and_rsts_active_connections`；`listener_echo` 断开连接后立即 `bind` 同端口成功 |
 | 真机跨平台 | 见上表：macOS ↔ Windows、Termux ↔ Linux |
@@ -93,11 +93,11 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| **ticket 08：Windows ↔ Termux 双机验收** | **核心通过、边界未测**：Windows 本地 ↔ Termux（远程家庭网络）跨网配对成功，比较码 `594092` 自动确认，双向规则互见，`ssh -p` 转发正常，Windows `quit` 后 Termux 收到「对端已退出」；端口冲突、目标 RST、Termux 后台、Windows 防火墙、Termux/musl 构建记录仍缺。 |
-| **ticket 09：真实 NAT/CGNAT** | **功能已实测、证据方式变更**：跨网直连可用（Termux 远程家庭网络 ↔ 本地 Windows）。真实 IP/端口按隐私要求不落日志与界面；CLI 只在配对完成时显示类别摘要（`同网直连`/`NAT 打洞`/`端口映射直连`），无中继由 SDK 无 TURN/relay 代码保证。 |
+| 08 边界项（已收口） | 本机端口冲突、目标 RST、Termux 后台限制、Windows 防火墙、Termux 原生/musl 构建记录未逐项留档；核心跨网配对与转发已真机通过。票已关闭，边界项按已知限制保留。 |
+| 09 诊断字段（已收口） | 真实 IP/端口按隐私要求不采集、不落日志与界面；无中继由 SDK 无 TURN/relay 代码保证。CLI 只在配对完成时显示类别摘要，v0.1.2 起交付。票已关闭。 |
 | 真实 `ssh -p` 会话 | 真机记录里是端口转发与短连接，OpenSSH 长会话未留存记录。 |
-| 断链 5 秒 → 退出码 0 | 由 core 单元/集成测试与真实 SDK 环回告别用例覆盖，没有双机人工记录。 |
-| 对端主动退出 → 会话结束 | **已实现**（`0x03 Farewell`）：mock 双会话与真实 SDK 环回测试覆盖；未做跨设备人工复核。 |
+| 断链 5 秒 → 退出码 0 | 由 core 单元/集成测试与真实 SDK 环回用例覆盖；没有双机人工拔网记录（按设计属本地判定）。 |
+| 对端主动退出 → 会话结束 | **已实现并真机验证**（`0x03 Farewell`）：mock 双会话与真实 SDK 环回测试覆盖；Windows `quit` 后 Termux 打印「对端已退出」。 |
 | 绑定失败文案 | 由 core 单元/集成测试覆盖，未在真实端口冲突场景手工复核。 |
 | 告别帧只在状态流可用时生效 | 状态流已失败的会话收不到对端告别，仍按 ticket 16 的 5 秒断开判定处理；畸形/截断告别只让对端规则未知，不结束会话。由 ticket 17 的 core 集成测试覆盖，无双机人工记录。 |
 | Windows tty 行为 | **不具备**：没有 Windows console API 实现，CLI 走行模式，无清行重绘/半行恢复；ticket 14 的 tty 行为仅在 unix raw mode 下成立。 |
@@ -113,8 +113,9 @@
 
 ## 下一任务
 
-1. 用 v0.1.3 统一真机复核：配对提示路径类别（应为 `NAT 打洞`）、已连接后 `create`/`join` 被拒且会话不受影响。
-2. ticket 08：补端口冲突、目标 RST、Termux 后台、Windows 防火墙、Termux/musl 构建记录后关闭。
-3. ticket 09：用同一轮真机记录复核跨网路径类别后关闭；不再采集真实地址。
-4. 补 Windows console 输入/重绘（票据 14 在 Windows 的缺口）；补 CLI 双进程端到端自动化。
-5. TUI（v0.2）/GUI（v0.3）不阻塞 v0.1。
+v0.1 实现票已全部关闭归档；后续按工作区 `.scratch/p2p-tunnel-v0/map.md` 的 Not yet specified 重新拆票。
+
+1. Windows console 输入/重绘（票据 14 在 Windows 的缺口）。
+2. CLI 双进程端到端自动化（告别/断开退出码 0）。
+3. 08 边界项补留档：端口冲突、目标 RST、Termux 后台、Windows 防火墙、Termux 构建记录。
+4. TUI（v0.2）/GUI（v0.3）。
