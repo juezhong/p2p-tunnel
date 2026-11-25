@@ -889,11 +889,13 @@ async fn run_listener(
                             port: forward.listen_port,
                         }))
                         .await;
+                    tracing::info!(listen_port = forward.listen_port, "TCP 连接已关闭");
                     drop(tcp);
                     continue;
                 };
 
-                tracing::debug!(listen_port = forward.listen_port, %peer, "接受 TCP 连接");
+                // 每条 TCP 的打开/关闭保持 info 级：默认 warn 不上屏，`RUST_LOG=info` 可排查。
+                tracing::info!(listen_port = forward.listen_port, %peer, "接受 TCP 连接");
                 active.fetch_add(1, Ordering::SeqCst);
                 let _ = shared
                     .events
@@ -945,6 +947,7 @@ async fn bridge_local(
                 operation: "等待数据链路重连",
             }))
             .await;
+        tracing::info!(listen_port, "TCP 连接已关闭");
         let _ = events.send(Event::ConnectionClosed { listen_port }).await;
         return;
     }
@@ -960,6 +963,7 @@ async fn bridge_local(
             tracing::debug!(listen_port, %error, "打开数据流失败，关闭 TCP");
         }
     }
+    tracing::info!(listen_port, "TCP 连接已关闭");
     let _ = events.send(Event::ConnectionClosed { listen_port }).await;
 }
 

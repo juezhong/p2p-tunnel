@@ -18,10 +18,46 @@ struct CliOutput {
     stderr: String,
 }
 
+/// 多数用例只断言交互文案：固定 `RUST_LOG=error`，不让 core 日志混进文本。
 fn run(args: &[&str], stdin: &str) -> CliOutput {
-    let mut child = Command::new(BIN)
-        // 不要让 core 的日志混进断言文本。
-        .env("RUST_LOG", "error")
+    run_with_env(args, stdin, Some("error"))
+}
+
+/// `rust_log` 为 `Some` 时设置 `RUST_LOG`；为 `None` 时移除环境变量，
+/// 走「未设置 RUST_LOG」的默认路径（票据 15 的回归入口）。
+fn run_with_env(args: &[&str], stdin: &str, rust_log: Option<&str>) -> CliOutput {
+    run_feeding(args, rust_log, |mut pipe| {
+        pipe.write_all(stdin.as_bytes()).expect("写入 stdin 失败");
+        // pipe 在此 drop，stdin 关闭；即使 quit 处理有问题也会 EOF。
+    })
+}
+
+/// 分步喂 stdin，给 core 的异步事件留出上屏时间。
+fn run_with_steps(args: &[&str], steps: &[(&str, Duration)], rust_log: Option<&str>) -> CliOutput {
+    run_feeding(args, rust_log, |mut pipe| {
+        for (text, delay) in steps {
+            pipe.write_all(text.as_bytes()).expect("写入 stdin 失败");
+            pipe.flush().expect("刷新 stdin 失败");
+            std::thread::sleep(*delay);
+        }
+    })
+}
+
+fn run_feeding(
+    args: &[&str],
+    rust_log: Option<&str>,
+    feed: impl FnOnce(std::process::ChildStdin),
+) -> CliOutput {
+    let mut command = Command::new(BIN);
+    match rust_log {
+        Some(value) => {
+            command.env("RUST_LOG", value);
+        }
+        None => {
+            command.env_remove("RUST_LOG");
+        }
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -48,9 +84,8 @@ fn run(args: &[&str], stdin: &str) -> CliOutput {
         stderr
     });
 
-    if let Some(mut pipe) = child.stdin.take() {
-        pipe.write_all(stdin.as_bytes()).expect("写入 stdin 失败");
-        // pipe 在此 drop，stdin 关闭；即使 quit 处理有问题也会 EOF。
+    if let Some(pipe) = child.stdin.take() {
+        feed(pipe);
     }
 
     let status = wait_with_deadline(&mut child);
@@ -263,6 +298,66 @@ fn close_missing_rule_uses_exact_message() {
     assert!(
         out.stdout.contains("[!] 没有本机规则监听 2211"),
         "stdout:\n{}",
+        out.stdout
+    );
+}
+
+/// 票据 15：不提供 `--log-file`，按未知参数处理（退出码 2），且不落任何日志文件。
+#[test]
+fn log_file_flag_is_unknown_argument_and_creates_no_file() {
+    let path = std::env::temp_dir().join(format!("p2p-tunnel-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let path_arg = path.to_str().expect("临时路径应是 UTF-8");
+    let pathed = format!("--log-file={path_arg}");
+
+    for args in [
+        vec!["--log-file"],
+        vec!["--log-file", path_arg],
+        vec![pathed.as_str()],
+    ] {
+        let out = run(&args, "");
+        assert_exit(&out, 2);
+        assert!(
+            out.stderr.contains("[!] 未知参数：--log-file"),
+            "args={args:?}\nstderr:\n{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("用法: p2p-tunnel [--help|--version]"),
+            "args={args:?}\nstderr:\n{}",
+            out.stderr
+        );
+        assert!(!path.exists(), "不得创建日志文件 {}", path.display());
+    }
+}
+
+/// 票据 15：不设置 `RUST_LOG` 时默认 `warn`——warn 仍写 stderr，且日志不上 stdout。
+#[test]
+fn unset_rust_log_keeps_warn_on_stderr_only() {
+    // 未配对时用非法 INVITE 触发一条 warn（解析失败）；中间留出上屏时间。
+    let out = run_with_steps(
+        &[],
+        &[
+            ("2\n", Duration::from_millis(300)),
+            ("bogus-invite\n", Duration::from_millis(1200)),
+            ("quit\n", Duration::ZERO),
+        ],
+        None,
+    );
+    assert_success(&out);
+    assert!(
+        out.stderr.contains("WARN") && out.stderr.contains("配对失败"),
+        "未设置 RUST_LOG 时 warn 仍应写 stderr：\nstderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("INFO"),
+        "默认级别下不应出现 info 日志：\nstderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("WARN"),
+        "日志不得写 stdout：\nstdout:\n{}",
         out.stdout
     );
 }

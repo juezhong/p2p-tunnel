@@ -610,9 +610,13 @@ $ p2p-tunnel
 
 ## 10. 日志与审计
 
-- `tunnel-core` 使用 `tracing` 宏；`tunnel-cli` 初始化 subscriber，默认 `info`，`RUST_LOG` 可调。
+- `tunnel-core` 使用 `tracing` 宏；`tunnel-cli` 初始化 subscriber：日志写 stderr，stdout 只承载交互界面。
+- 默认（未设置 `RUST_LOG`）只输出 `warn` 及以上；`quinn=off`、`quinn_proto=off` 保持静音。每条 TCP 的打开/关闭与审计行都是 `info` 级，默认不上屏。
+- 设置 `RUST_LOG` 时完全以它为准：`RUST_LOG=info` 可临时看到每条 TCP 打开/关闭与审计行，去掉即恢复默认。
+- 不提供 `--log-file`（按未知参数处理，打印用法并退出码 2），也不引入任何日志文件路径或需要清理的日志缓存。
+- 连接建立成功只在会话建立时提示一次（`[+] 配对完成，已连接`）；链路已连接状态下不重复打印。
 - 日志字段：`listen_port`、`peer_port`、`target_port`、`generation`、`link_phase`、`error`。
-- 目标端审计日志（info）：
+- 目标端审计日志（`info` 级，默认不上屏，`RUST_LOG=info` 可见）：
   ```text
   target_port=22 peer_session=<hash> result=ok
   target_port=3306 peer_session=<hash> result=dial_failed

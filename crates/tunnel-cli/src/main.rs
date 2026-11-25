@@ -104,16 +104,29 @@ fn event_prints(event: &Event) -> bool {
 }
 
 fn init_tracing() {
-    // bootstrap 连接按设计在配对后关闭，quinn 会打一条 ERROR 级
-    // “UDP demultiplexer shut down”，对用户是噪声；默认关掉，调试时用
-    // `RUST_LOG` 打开。日志写 stderr，stdout 只留交互界面。
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=off,quinn_proto=off"));
+    // 日志写 stderr，stdout 只留交互界面。默认只让 warn 及以上上屏；
+    // 设置 `RUST_LOG` 时完全以它为准（如 `RUST_LOG=info` 临时排查）。
+    let rust_log = std::env::var("RUST_LOG").ok();
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(log_filter(rust_log.as_deref()))
         .with_target(false)
         .with_writer(io::stderr)
         .try_init();
+}
+
+/// 未设置 `RUST_LOG` 时默认 `warn`；quinn 的 bootstrap 收尾噪声默认静音。
+/// 解析失败时退回默认，避免一条坏环境变量让程序无法启动。
+fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    // bootstrap 连接按设计在配对后关闭，quinn 会打一条 ERROR 级
+    // “UDP demultiplexer shut down”，对用户是噪声；默认关掉，调试时用
+    // `RUST_LOG` 打开。
+    let default = || tracing_subscriber::EnvFilter::new("warn,quinn=off,quinn_proto=off");
+    match rust_log {
+        Some(directives) => {
+            tracing_subscriber::EnvFilter::try_new(directives).unwrap_or_else(|_| default())
+        }
+        None => default(),
+    }
 }
 
 async fn run() -> ExitCode {
@@ -550,6 +563,7 @@ struct UiState {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
 
     fn connected_ui() -> UiState {
         let mut ui = UiState {
@@ -638,5 +652,102 @@ mod tests {
         }
         writer.join().expect("写线程结束");
         assert_eq!(count, 10_000);
+    }
+
+    /// 收集日志输出的内存 writer，实现 `MakeWriter` 以便测试 CLI 的过滤规则。
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("日志缓冲锁")).into_owned()
+        }
+    }
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("日志缓冲锁").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 用 CLI 自己的过滤规则（`log_filter`）渲染一段日志，返回 stderr 文本。
+    fn capture_logs(rust_log: Option<&str>, emit: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(log_filter(rust_log))
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        capture.text()
+    }
+
+    // 注意：每个测试使用自己内联的 tracing 宏调用点，避免 tracing 的全局
+    // callsite 兴趣缓存被另一个测试的过滤器污染（同一进程并行跑测试）。
+
+    #[test]
+    fn unset_rust_log_defaults_to_warn_and_silences_quinn() {
+        let output = capture_logs(None, || {
+            tracing::info!(
+                target: "tunnel_core::bridge",
+                target_port = 22,
+                peer_session = "session-abc",
+                result = "ok",
+                "目标端口连接已建立"
+            );
+            tracing::error!(target: "quinn", "UDP demultiplexer shut down");
+            tracing::error!(target: "quinn_proto", "connection closed");
+            tracing::warn!(target: "tunnel_core::session", "需要用户关心的告警");
+        });
+        assert!(
+            !output.contains("目标端口连接已建立"),
+            "未设置 RUST_LOG 时 info 审计行不应上屏：\n{output}"
+        );
+        assert!(
+            !output.contains("demultiplexer"),
+            "quinn 噪声默认静音：\n{output}"
+        );
+        assert!(
+            !output.contains("connection closed"),
+            "quinn_proto 噪声默认静音：\n{output}"
+        );
+        assert!(
+            output.contains("需要用户关心的告警"),
+            "未设置 RUST_LOG 时 warn 仍应可见：\n{output}"
+        );
+    }
+
+    #[test]
+    fn rust_log_info_reveals_audit_line_and_fields() {
+        let output = capture_logs(Some("info"), || {
+            tracing::info!(
+                target: "tunnel_core::bridge",
+                target_port = 22,
+                peer_session = "session-abc",
+                result = "ok",
+                "目标端口连接已建立"
+            );
+        });
+        assert!(
+            output.contains("目标端口连接已建立"),
+            "RUST_LOG=info 时应显示审计行：\n{output}"
+        );
+        assert!(output.contains("target_port=22"), "{output}");
+        assert!(output.contains("peer_session=\"session-abc\""), "{output}");
+        assert!(output.contains("result=\"ok\""), "{output}");
     }
 }
