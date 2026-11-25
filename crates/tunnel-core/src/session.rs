@@ -22,8 +22,8 @@ use crate::api::{Command, Event, Forward, LinkState, TunnelError};
 use crate::bridge;
 use crate::limits::StreamBudget;
 use crate::pairing::{ConnectedLink, PairingDriver, SdkPairing};
-use crate::protocol::{RuleFrame, CODE_CANCELLED, FRAME_HEADER_LEN};
-use crate::rule_sync::{self, PeerUpdate};
+use crate::protocol::{RuleFrame, CODE_CANCELLED};
+use crate::rule_sync::{self, FarewellSignal, PeerUpdate, StateLostSignal};
 use crate::transport::{open_bi_with_timeout, DataLink};
 
 /// 命令通道容量。UI 是低频率的人机操作，32 足够且能自然施加背压。
@@ -120,7 +120,7 @@ impl Session {
         let (event_tx, event_rx) = mpsc::channel::<Event>(EVENT_CHANNEL);
         let (snapshots, _) = rule_sync::snapshot_channel();
         let (link_lost, _) = watch::channel(0u64);
-        let (farewell, farewell_events) = mpsc::channel::<()>(1);
+        let (farewell, farewell_events) = mpsc::channel(1);
         let budget = StreamBudget::new();
         let tasks = TaskRegistry::new();
 
@@ -159,6 +159,7 @@ impl Session {
                 farewell,
                 farewell_events: Some(farewell_events),
                 tasks,
+                ending: false,
             }
             .run(command_rx)
             .await;
@@ -293,16 +294,31 @@ struct Worker {
     /// 目标端审计日志用的稳定会话标识（比较码派生，不含比较码本身）。
     peer_session: Arc<str>,
     /// 对端 `Farewell` 通知的发送端（分流器 → 主循环）；保留一份避免通道关闭。
-    farewell: mpsc::Sender<()>,
+    farewell: mpsc::Sender<FarewellSignal>,
     /// 对端 `Farewell` 通知的接收端，由 [`Worker::run`] 取出轮询。
-    farewell_events: Option<mpsc::Receiver<()>>,
+    farewell_events: Option<mpsc::Receiver<FarewellSignal>>,
     /// 本会话派生的 bridge 任务；退出时统一收尾。
     tasks: TaskRegistry,
+    /// 已进入结束路径：此后不再上报重连/断开计时相关事件（SPEC §9.5）。
+    ending: bool,
+}
+
+/// 会话结束原因；决定清理时是否回发 `Farewell`、是否上报 `SessionLost`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndReason {
+    /// 本端要求退出（`Shutdown`、Ctrl-C、stdin EOF）。
+    LocalExit,
+    /// 对端通过 `Farewell` 主动退出。
+    PeerFarewell,
+    /// 重连 5 秒未恢复：按「断开连接」退出。
+    Disconnected,
+    /// 认证失败或链路停止：会话不可恢复。
+    SessionLost,
 }
 
 impl Worker {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
-        let (lost_tx, mut lost_rx) = mpsc::channel::<()>(1);
+        let (lost_tx, mut lost_rx) = mpsc::channel(1);
         if self.link.is_some() {
             self.link_state = self.link.as_ref().map(|link| link.subscribe_link_state());
             self.start_state_streams(lost_tx.clone());
@@ -316,9 +332,8 @@ impl Worker {
         let mut phases = self.link_state.clone();
         // `accept_bi` 循环退出（SDK 已停止）时的一次性兜底信号。
         let mut watching_loss = true;
-        let mut session_lost = false;
-        // 对端主动 Farewell：本端不发送告别、也不进入重连。
-        let mut peer_exited = false;
+        // 结束原因：除了 `SessionLost` 之外的结束都不上报「会话丢失」。
+        let mut end_reason = EndReason::LocalExit;
         loop {
             tokio::select! {
                 command = commands.recv() => {
@@ -352,8 +367,8 @@ impl Worker {
                 phase = recv_link_phase(&mut phases) => {
                     match phase {
                         Some(phase) => {
-                            if self.handle_link_state(phase, &lost_tx).await {
-                                session_lost = true;
+                            if let Some(reason) = self.handle_link_state(phase, &lost_tx).await {
+                                end_reason = reason;
                                 break;
                             }
                             updates = self.updates.take();
@@ -371,7 +386,7 @@ impl Worker {
                 signal = recv_optional(farewells.as_mut()), if farewells.is_some() => {
                     if signal.is_some() {
                         self.handle_peer_farewell().await;
-                        peer_exited = true;
+                        end_reason = EndReason::PeerFarewell;
                         break;
                     }
                     farewells = None;
@@ -381,18 +396,24 @@ impl Worker {
                     // 退出码 0，不再等 120 秒报「会话丢失」。
                     tracing::warn!("数据链路重连 5 秒未恢复，按断开连接退出");
                     let _ = self.events.send(Event::Disconnected).await;
-                    self.session_lost();
+                    self.end_session();
+                    end_reason = EndReason::Disconnected;
                     break;
                 }
             }
         }
 
-        // 主动退出时尽力通知对端；链路已断或无对端时跳过，绝不阻塞退出。
-        if !session_lost && !peer_exited {
+        // 退出顺序按 SPEC §9.5：先停 listener、reset 活动连接并收尾 bridge/
+        // 状态流，再发 Farewell，最后释放链路与 SDK peer；先发 Farewell 时
+        // listener 仍可能接新 TCP，不符合规格顺序。
+        self.stop_forwarding().await;
+        if end_reason == EndReason::LocalExit {
+            // 只有本端主动退出才通知对端；对端 Farewell/断链/会话丢失
+            // 的收尾不再发告别。
             self.send_farewell().await;
         }
-        self.stop_all().await;
-        if session_lost {
+        self.release_session().await;
+        if end_reason == EndReason::SessionLost {
             let _ = self
                 .events
                 .send(Event::Error(TunnelError::SessionLost))
@@ -401,8 +422,18 @@ impl Worker {
         let _ = self.events.send(Event::LinkState(LinkState::Stopped)).await;
     }
 
-    /// 应用数据链路阶段变化；返回 `true` 表示会话已不可恢复，循环应结束。
-    async fn handle_link_state(&mut self, phase: LinkState, lost: &mpsc::Sender<()>) -> bool {
+    /// 应用数据链路阶段变化；返回结束原因表示会话已不可恢复，循环应结束。
+    ///
+    /// 进入结束路径后（`ending`）直接忽略后续阶段，避免对端 `Farewell`
+    /// 或断开判定之后又冒出 `Reconnecting` 与断开计时事件（SPEC §9.5）。
+    async fn handle_link_state(
+        &mut self,
+        phase: LinkState,
+        lost: &mpsc::Sender<StateLostSignal>,
+    ) -> Option<EndReason> {
+        if self.ending {
+            return None;
+        }
         match phase {
             LinkState::Connected => {
                 if self.reconnecting_since.take().is_some() {
@@ -420,11 +451,11 @@ impl Worker {
                     // `Ready` 表示「配对完成」，一次配对只发一次；重连只发
                     // `LinkState(Connected)`（§9.1 步骤 6）。
                 }
-                false
+                None
             }
             LinkState::Reconnecting => {
                 self.handle_link_lost().await;
-                false
+                None
             }
             LinkState::AuthenticationFailed => {
                 // SPEC §9.2：认证失败不可恢复，直接结束会话。
@@ -433,27 +464,27 @@ impl Worker {
                     .events
                     .send(Event::LinkState(LinkState::AuthenticationFailed))
                     .await;
-                self.session_lost();
-                true
+                self.end_session();
+                Some(EndReason::SessionLost)
             }
             LinkState::Stopped => {
                 tracing::warn!("数据链路已停止，会话结束");
-                self.session_lost();
-                true
+                self.end_session();
+                Some(EndReason::SessionLost)
             }
             LinkState::Connecting => {
                 let _ = self
                     .events
                     .send(Event::LinkState(LinkState::Connecting))
                     .await;
-                false
+                None
             }
         }
     }
 
     /// 处理一次链路断开：RST 活动连接、保留 listener、标记对端规则过期。
     async fn handle_link_lost(&mut self) {
-        if self.reconnecting_since.is_some() {
+        if self.ending || self.reconnecting_since.is_some() {
             return;
         }
         let now = tokio::time::Instant::now();
@@ -487,10 +518,9 @@ impl Worker {
         let attempt = tokio::time::timeout(FAREWELL_TIMEOUT, async {
             let stream = open_bi_with_timeout(&*link).await?;
             let (mut read, mut write) = stream.split();
-            let mut frame = [0u8; FRAME_HEADER_LEN];
-            let len = RuleFrame::Farewell.encode(&mut frame)?;
+            let frame = RuleFrame::farewell_frame();
             write
-                .write_all(&frame[..len])
+                .write_all(&frame)
                 .await
                 .map_err(|error| TunnelError::Network(format!("发送 Farewell 失败：{error}")))?;
             write.finish()?;
@@ -522,7 +552,7 @@ impl Worker {
     async fn handle_peer_farewell(&mut self) {
         tracing::info!("收到对端 Farewell，会话结束");
         let _ = self.events.send(Event::PeerFarewell).await;
-        self.session_lost();
+        self.end_session();
     }
 
     /// 终止当前链路代的规则同步任务；重连后由 [`Self::restart_state_streams`] 重开。
@@ -533,14 +563,19 @@ impl Worker {
         }
     }
 
-    async fn restart_state_streams(&mut self, lost: mpsc::Sender<()>) {
+    async fn restart_state_streams(&mut self, lost: mpsc::Sender<StateLostSignal>) {
         self.abort_state_streams().await;
         self.updates = None;
         self.start_state_streams(lost);
     }
 
-    /// 会话不可恢复：清空对端规则并停止重连倒计时；listener 由 `stop_all` 关闭。
-    fn session_lost(&mut self) {
+    /// 进入会话结束路径：清空对端规则、停止重连倒计时，并抑制后续
+    /// `Reconnecting`/断开计时事件；listener 由 `stop_forwarding` 关闭。
+    ///
+    /// 只有 `AuthenticationFailed`/`Stopped` 会再上报 `SessionLost`；
+    /// 对端 `Farewell` 与 5 秒断开走正常结束（SPEC §9.2、§9.5）。
+    fn end_session(&mut self) {
+        self.ending = true;
         self.reconnecting_since = None;
         self.reconnect_deadline = None;
         self.peer_rules.clear();
@@ -595,7 +630,11 @@ impl Worker {
     }
 
     /// 应用配对驱动的上报：代码事件直接转发，`Connected` 安装数据链路。
-    async fn handle_pairing_event(&mut self, event: PairingEvent, lost: &mpsc::Sender<()>) {
+    async fn handle_pairing_event(
+        &mut self,
+        event: PairingEvent,
+        lost: &mpsc::Sender<StateLostSignal>,
+    ) {
         match event {
             PairingEvent::InviteCode(invite) => {
                 let _ = self.events.send(Event::InviteCode(invite)).await;
@@ -627,7 +666,7 @@ impl Worker {
     }
 
     /// 启动首字节分流 + 状态流分发；出站端再启动打开/重开监督循环。
-    fn start_state_streams(&mut self, lost: mpsc::Sender<()>) {
+    fn start_state_streams(&mut self, lost: mpsc::Sender<StateLostSignal>) {
         let Some(link) = self.link.clone() else {
             return;
         };
@@ -639,6 +678,7 @@ impl Worker {
             mpsc::channel::<rule_sync::StateStreamParts>(rule_sync::STATE_STREAM_CHANNEL);
         let inbound_updates = update_tx.clone();
         let inbound_snapshots = self.snapshots.subscribe();
+        let inbound_farewell = self.farewell.clone();
         // 分发任务：新状态流替换旧状态流（重开/对端重发）。
         let inbound = tokio::spawn(async move {
             let mut current = ChildGuard::new();
@@ -650,6 +690,7 @@ impl Worker {
                         parts.first,
                         inbound_snapshots.clone(),
                         inbound_updates.clone(),
+                        inbound_farewell.clone(),
                     )))
                     .await;
             }
@@ -672,6 +713,7 @@ impl Worker {
                 link,
                 self.snapshots.subscribe(),
                 update_tx,
+                self.farewell.clone(),
             ));
             self.state_tasks.push(outbound);
         }
@@ -857,12 +899,20 @@ impl Worker {
         );
     }
 
-    async fn stop_all(&mut self) {
+    /// 退出清理第一阶段（SPEC §9.5）：停所有 listener → reset 活动连接并等
+    /// bridge 收尾 → 关闭状态流。数据链路保留给随后的 Farewell 使用。
+    async fn stop_forwarding(&mut self) {
+        // 从这里开始不再处理重连/断开计时，避免收尾期间又上报状态。
+        self.ending = true;
         self.stop_listeners("退出时关闭规则").await;
         // 等 bridge 任务把 RST 写到本地 TCP 并释放数据流名额，再拆链路。
         self.tasks.finish_all(TASK_CLEANUP_TIMEOUT).await;
         self.abort_state_streams().await;
-        // 先释放数据链路：drop 会让 SDK managed link 的 worker 停止。
+    }
+
+    /// 退出清理第二阶段：释放数据链路（drop 会让 SDK managed link 的
+    /// worker 停止），停止配对任务并释放 SDK peer。
+    async fn release_session(&mut self) {
         self.link = None;
         if let Some(commands) = self.pairing_commands.take() {
             let _ = commands.send(PairingCommand::Stop).await;
@@ -1303,6 +1353,7 @@ mod tests {
             farewell: mpsc::channel(1).0,
             farewell_events: None,
             tasks: TaskRegistry::new(),
+            ending: false,
         };
 
         worker

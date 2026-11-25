@@ -25,11 +25,14 @@ crates/
 │   │   ├── sdk.rs      SDK ManagedAuthenticatedLink → DataLink 适配（跨 generation 重连）
 │   │   ├── quinn_link.rs 测试/诊断用单条 quinn::Connection → DataLink 适配（生产不走这条）
 │   │   └── mock.rs     内存双端链路，供测试
-│   ├── protocol.rs     6 字节数据流头、Hello/RuleList 状态帧、错误码
+│   ├── protocol.rs     6 字节数据流头、Hello/RuleList/Farewell 状态帧、错误码
 │   ├── rule_sync.rs    规则同步流：首字节分流、全量快照重发、Unknown/Stale 降级
 │   ├── bridge.rs       单条 TCP ↔ bi stream 手动双泵（16 KiB 有界缓冲）、FIN/RST/STOP、目标拨号与审计日志
 │   └── limits.rs       每规则 64 连接、每侧 96 数据流的 RAII 名额
-├── tunnel-cli/src/main.rs   v0.1 唯一可用 UI
+├── tunnel-cli/src/
+│   ├── main.rs         v0.1 唯一可用 UI：命令解析、事件渲染、退出码
+│   ├── input.rs        stdin 读取：tty 逐字节 + 行编辑（unix raw mode）；非 tty 整行
+│   └── output.rs       输出层：可注入 writer、tty 清行/重绘提示符、非 tty 纯文本
 ├── tunnel-tui/src/lib.rs    占位（v0.2）
 └── tunnel-gui/src/lib.rs    占位（v0.3）
 ```
@@ -39,7 +42,7 @@ crates/
 ## 运行时结构
 
 ```text
-stdin 线程 ──行──▶ CLI select! ──Command──▶ Session worker
+stdin 线程 ──InputEvent──▶ CLI select! ──Command──▶ Session worker
                       ▲                        │
                       └──────── Event ◀────────┘
                                                │
@@ -56,23 +59,30 @@ stdin 线程 ──行──▶ CLI select! ──Command──▶ Session worke
 - 配对成功后才建数据链路与 listener；`Ready` 前 `AddForward` 直接返回 `Error`。
 - 客户端 `bootstrap` 只作会话锚点，应用数据走 `manage_link()` 返回的附加 QUIC。
 - 链路阶段变化（`Connecting/Connected/Reconnecting/AuthenticationFailed/Stopped`）由 SDK 订阅转成 `LinkState` 事件；重连期间先发 `PeerRulesStale`，恢复后重发规则快照。`Ready` 每次配对只发一次，重连只发 `LinkState(Connected)`。
-- 会话不可恢复时依次发 `Error(SessionLost)` 与 `LinkState(Stopped)`；CLI 以退出码 `1` 结束。
+- 会话结束分三类，收尾顺序统一为先停 listener、reset 活动连接并等 bridge 收尾，再发 `Farewell`（仅本端主动退出），最后释放链路与 SDK peer（SPEC §9.5）：
+  - 本端 `quit`/`exit`/Ctrl-C/EOF：尽力发 `Farewell`，随后 `LinkState(Stopped)`，CLI 退出码 `0`。
+  - 对端 `Farewell`：发 `Event::PeerFarewell`，不再进入 `Reconnecting`，清理后 `LinkState(Stopped)`，CLI 退出码 `0`。
+  - 重连 5 秒未恢复：发 `Event::Disconnected` + `LinkState(Stopped)`，CLI 打印「断开连接」并退出 `0`。
+  - 只有认证失败或链路 `Stopped` 才发 `Error(SessionLost)` 与 `LinkState(Stopped)`，CLI 以退出码 `1` 结束。
 
 ## CLI 行为要点
 
 - 命令按空白切分；`add`/`close` 先做本地校验（端口、参数个数、是否本机规则），再交给 core。
 - 等待粘贴 INVITE/REPLY 时仍接受 `help`/`status`/`quit`，避免交互死锁；其余整行按配对码发送。
-- stdin 读取线程通过**有界**通道（容量 64）把行交给主循环；通道满时读线程阻塞，主循环卡住时不会把输入堆进内存。
+- stdin 读取线程通过**有界**通道（容量 64）把 `InputEvent` 交给主循环：tty 下逐字节（供行编辑与提示符重绘），非 tty 下整行；通道满时读线程阻塞，主循环卡住时不会把输入堆进内存。
+- 所有用户可见输出经输出层：tty（unix raw mode）下清行、重绘 `> ` 与未提交输入；非 tty 只发普通换行，不发光标控制。清行重绘仅 unix 支持，Windows 走行模式（SPEC §8.5）。
 - `status` 按 SPEC §8.3 输出四段：链路（连接时含 `managed link`）、本机规则（`监听中` + 连接数）、对端规则（`B:<port> -> 本机:<port>`）、逐条活动连接（`本机:<port> 的连接 -> 对端:<port>`）。
 - 状态全部来自 core 事件：未配对显示「未连接」，重连显示「链路: 重连中」并标注对端规则可能过期，规则同步流不可用时标注「规则未知」。
 - `close` 成功的 `[-] <port> 已关闭（活动连接已重置）` 在 core 的 `RulesChanged` 到达后才打印；失败会回滚并显示 `[!]` 错误。
-- 退出路径（`quit`/Ctrl-C/EOF）统一发送 `Shutdown`，先排空已产生事件再等 core 清理，总上限 5 秒。
+- 退出路径（`quit`/`exit`/菜单 `3`/Ctrl-C/EOF）统一发送 `Shutdown`，先排空已产生事件再等 core 清理，总上限 5 秒。
 
 ## 测试布局
 
 - `crates/tunnel-core/src/**`：单元测试（编解码、bridge、limits、session 状态机等）。
 - `crates/tunnel-core/tests/listener_echo.rs`：真实 TCP/listener 行为。
 - `crates/tunnel-core/tests/rule_sync.rs`：规则同步与 JSON 快照语义。
+- `crates/tunnel-core/tests/farewell.rs`：告别、断链 5 秒判定与畸形 Farewell 边界。
+- `crates/tunnel-cli/src/input.rs`：行编辑状态机单测；`src/output.rs`：清行/重绘/非 tty 语义单测（内存 writer）。
 - `crates/tunnel-cli/tests/cli.rs`：启动真实二进制、管道驱动 stdin，断言文案与退出码；不需要网络。
 
 ## 与规格的关系
@@ -86,7 +96,8 @@ ticket 10 任务描述里写的 “SPEC §7.7” 在 `SPEC.md` 中不存在；CL
 
 - `Event::PeerRulesUnknown`：状态流不可用、对端规则未知。
 - `Event::PeerRulesStale`：链路重连中，最后一次快照可能过期。
-- `TunnelError::SessionLost`：会话不可恢复，CLI 据此清空对端规则并以退出码 1 结束。
+- `Event::PeerFarewell` / `Event::Disconnected`：对端主动退出 / 重连 5 秒未恢复；二者都走正常结束（清理后退出码 0），不产生 `SessionLost`。
+- `TunnelError::SessionLost`：仅认证失败或链路 `Stopped` 时上报，CLI 据此清空对端规则并以退出码 1 结束。
 - CLI 文案「未配对时链路显示未连接」「对端规则未知」「链路重连中…」。
 
 `Command::Stop` 已按 §7.3/§7.5 实现（停 listener、RST 活动连接、关数据链路、保留 core），v0.1 CLI 不使用，保留给 TUI/GUI。

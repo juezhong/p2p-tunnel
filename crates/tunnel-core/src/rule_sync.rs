@@ -55,6 +55,15 @@ pub(crate) enum PeerUpdate {
     Unknown,
 }
 
+/// 状态流读到合法 `Farewell` 的信号。具名类型避免与 `StateLostSignal`
+/// 这类裸 `()` 通道混用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FarewellSignal;
+
+/// 状态流分发器失败（`accept_bi` 结束）的信号：主循环按链路断开处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StateLostSignal;
+
 /// 接受侧状态流的两半；由首字节分流的分类任务交给分发任务。
 /// 已被分流器读掉首字节的一条状态流：`first` 必须交回帧解码器。
 pub(crate) struct StateStreamParts {
@@ -78,10 +87,11 @@ pub(crate) async fn run_state_stream(
     first: Option<u8>,
     snapshots: watch::Receiver<Vec<Forward>>,
     updates: mpsc::Sender<PeerUpdate>,
+    farewell: mpsc::Sender<FarewellSignal>,
 ) -> Result<(), TunnelError> {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let mut writer = tokio::spawn(state_writer(write, snapshots, cancel_rx.clone()));
-    let mut reader = tokio::spawn(state_reader(read, first, updates, cancel_rx));
+    let mut reader = tokio::spawn(state_reader(read, first, updates, farewell, cancel_rx));
 
     enum First {
         Writer(Result<Result<(), TunnelError>, tokio::task::JoinError>),
@@ -161,9 +171,10 @@ async fn state_reader(
     mut read: Box<dyn TunnelRead>,
     first: Option<u8>,
     updates: mpsc::Sender<PeerUpdate>,
+    farewell: mpsc::Sender<FarewellSignal>,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(), TunnelError> {
-    let result = state_reader_loop(&mut *read, first, &updates, &mut cancel).await;
+    let result = state_reader_loop(&mut *read, first, &updates, &farewell, &mut cancel).await;
     // 不再接收：STOP_SENDING，错误码 0x01（关闭而不是 reset）。
     let _ = read.stop(CODE_PROTOCOL_ERROR);
     result
@@ -173,6 +184,7 @@ async fn state_reader_loop(
     read: &mut dyn TunnelRead,
     first: Option<u8>,
     updates: &mpsc::Sender<PeerUpdate>,
+    farewell: &mpsc::Sender<FarewellSignal>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<(), TunnelError> {
     let mut buffer = [0u8; STATE_FRAME_BUFFER];
@@ -201,7 +213,12 @@ async fn state_reader_loop(
                             .map_err(|_| TunnelError::Internal("状态更新通道已关闭".into()))?;
                     }
                     RuleFrame::Farewell => {
-                        tracing::debug!("状态流收到 Farewell，按正常结束处理");
+                        // 与专用告别流走同一条会话收尾路径（SPEC §5.4、§9.5）：
+                        // 只在状态流仍可用时才能读到；畸形 Farewell 已在解码阶段失败。
+                        tracing::info!("状态流收到 Farewell，结束会话");
+                        if farewell.send(FarewellSignal).await.is_err() {
+                            tracing::debug!("告别信号通道已关闭");
+                        }
                         return Ok(());
                     }
                 }
@@ -271,11 +288,11 @@ async fn read_frame(
 pub(crate) fn spawn_demux(
     link: Arc<dyn DataLink>,
     state: mpsc::Sender<StateStreamParts>,
-    farewell: mpsc::Sender<()>,
+    farewell: mpsc::Sender<FarewellSignal>,
     link_lost: watch::Receiver<u64>,
     budget: StreamBudget,
     peer_session: Arc<str>,
-    lost: mpsc::Sender<()>,
+    lost: mpsc::Sender<StateLostSignal>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -293,7 +310,7 @@ pub(crate) fn spawn_demux(
                 }
                 Err(error) => {
                     tracing::debug!(%error, "accept_bi 循环结束");
-                    let _ = lost.send(()).await;
+                    let _ = lost.send(StateLostSignal).await;
                     break;
                 }
             }
@@ -304,7 +321,7 @@ pub(crate) fn spawn_demux(
 async fn classify_stream(
     stream: Box<dyn TunnelStream>,
     state: mpsc::Sender<StateStreamParts>,
-    farewell: mpsc::Sender<()>,
+    farewell: mpsc::Sender<FarewellSignal>,
     link_lost: watch::Receiver<u64>,
     budget: StreamBudget,
     peer_session: Arc<str>,
@@ -349,15 +366,20 @@ async fn classify_stream(
         }
     } else if first_byte == FRAME_FAREWELL {
         // Farewell 帧长度必须是 0；剩余 2 字节仍受同一个首帧截止时间约束。
-        let mut rest = [0u8; 2];
+        // 长度判定复用协议层，避免这里与 `RuleFrame::decode` 各写一份。
+        let mut rest = [0u8; FRAME_HEADER_LEN - 1];
         let read_rest =
             tokio::time::timeout_at(started + bridge::HEADER_TIMEOUT, read.read_exact(&mut rest))
                 .await;
-        if !matches!(read_rest, Ok(Ok(_))) || u16::from_be_bytes(rest) != 0 {
+        let Ok(Ok(_)) = read_rest else {
+            let _ = write.reset(CODE_PROTOCOL_ERROR);
+            return;
+        };
+        if RuleFrame::decode_farewell(u16::from_be_bytes(rest) as usize).is_err() {
             let _ = write.reset(CODE_PROTOCOL_ERROR);
             return;
         }
-        if farewell.send(()).await.is_err() {
+        if farewell.send(FarewellSignal).await.is_err() {
             tracing::debug!("告别信号通道已关闭");
         }
         // 对端已告别：只做正常半关闭，不 reset（SPEC §5.4 关闭语义）。
@@ -374,8 +396,18 @@ pub(crate) async fn serve_inbound_state(
     first: u8,
     snapshots: watch::Receiver<Vec<Forward>>,
     updates: mpsc::Sender<PeerUpdate>,
+    farewell: mpsc::Sender<FarewellSignal>,
 ) {
-    match run_state_stream(read, write, Some(first), snapshots, updates.clone()).await {
+    match run_state_stream(
+        read,
+        write,
+        Some(first),
+        snapshots,
+        updates.clone(),
+        farewell,
+    )
+    .await
+    {
         Ok(()) => {}
         Err(error) => {
             tracing::debug!(%error, "状态流结束，对端规则未知");
@@ -389,6 +421,7 @@ pub(crate) async fn supervise_outbound(
     link: Arc<dyn DataLink>,
     snapshots: watch::Receiver<Vec<Forward>>,
     updates: mpsc::Sender<PeerUpdate>,
+    farewell: mpsc::Sender<FarewellSignal>,
 ) {
     let mut backoff = REOPEN_BACKOFF_MIN;
     loop {
@@ -401,8 +434,15 @@ pub(crate) async fn supervise_outbound(
             Ok(stream) => {
                 backoff = REOPEN_BACKOFF_MIN;
                 let (read, write) = stream.split();
-                if let Err(error) =
-                    run_state_stream(read, write, None, snapshots.clone(), updates.clone()).await
+                if let Err(error) = run_state_stream(
+                    read,
+                    write,
+                    None,
+                    snapshots.clone(),
+                    updates.clone(),
+                    farewell.clone(),
+                )
+                .await
                 {
                     tracing::debug!(%error, "规则同步流失败，对端规则未知");
                     let _ = updates.send(PeerUpdate::Unknown).await;
@@ -491,12 +531,14 @@ mod tests {
         let pair = state_pair().await;
         let (snapshot_tx, snapshot_rx) = snapshot_channel();
         let (update_tx, mut update_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
+        let (farewell_tx, _farewell_rx) = mpsc::channel(1);
         let task = tokio::spawn(run_state_stream(
             pair.ours_read,
             pair.ours_write,
             None,
             snapshot_rx,
             update_tx,
+            farewell_tx,
         ));
         let mut peer_read = pair.peer_read;
         let mut peer_write = pair.peer_write;
@@ -544,17 +586,71 @@ mod tests {
         task.await.expect("任务可等待").expect("正常收尾");
     }
 
+    /// 状态流上的合法 Farewell 与专用告别流一致：上报告别信号，
+    /// 而不是静默结束状态流（SPEC §5.4、§9.5）。
     #[tokio::test]
-    async fn rapid_changes_coalesce_to_latest_snapshot() {
+    async fn farewell_on_state_stream_signals_session_end() {
         let pair = state_pair().await;
         let (snapshot_tx, snapshot_rx) = snapshot_channel();
-        let (update_tx, _update_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
+        let (update_tx, mut update_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
+        let (farewell_tx, mut farewell_rx) = mpsc::channel(1);
         let task = tokio::spawn(run_state_stream(
             pair.ours_read,
             pair.ours_write,
             None,
             snapshot_rx,
             update_tx,
+            farewell_tx,
+        ));
+        let mut peer_read = pair.peer_read;
+        let mut peer_write = pair.peer_write;
+
+        let (kind, _) = read_raw_frame(&mut peer_read).await;
+        assert_eq!(kind, FRAME_HELLO);
+        expect_rule_list(&mut peer_read).await;
+
+        peer_write
+            .write_all(&encode(&RuleFrame::Hello))
+            .await
+            .expect("写 Hello");
+        peer_write
+            .write_all(&encode(&RuleFrame::RuleList(vec![rule(2211, 22)])))
+            .await
+            .expect("写 RuleList");
+        match update_rx.recv().await.expect("收到对端快照") {
+            PeerUpdate::Snapshot(rules) => assert_eq!(rules, vec![rule(2211, 22)]),
+            PeerUpdate::Unknown => panic!("不应标记未知"),
+        }
+
+        peer_write
+            .write_all(&encode(&RuleFrame::Farewell))
+            .await
+            .expect("写 Farewell");
+        tokio::time::timeout(Duration::from_secs(1), farewell_rx.recv())
+            .await
+            .expect("状态流 Farewell 应上报告别")
+            .expect("告别通道未关闭");
+
+        // 状态流按“关闭”语义收尾：读半 stop(0x01)，对端读到 EOF 而不是 reset。
+        let mut byte = [0u8; 1];
+        assert_eq!(peer_read.read(&mut byte).await.expect("读到 EOF"), 0);
+        task.await.expect("任务可等待").expect("正常收尾");
+        drop(snapshot_tx);
+    }
+
+    #[tokio::test]
+    async fn rapid_changes_coalesce_to_latest_snapshot() {
+        let pair = state_pair().await;
+        let (snapshot_tx, snapshot_rx) = snapshot_channel();
+        let (update_tx, _update_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
+        let (farewell_tx, _farewell_rx) = mpsc::channel(1);
+        let task = tokio::spawn(run_state_stream(
+            pair.ours_read,
+            pair.ours_write,
+            None,
+            snapshot_rx,
+            update_tx,
+            farewell_tx,
         ));
         let mut peer_read = pair.peer_read;
 
@@ -587,16 +683,23 @@ mod tests {
     }
 
     /// 断言一帧畸形数据被协议拒绝，并且状态流“关闭”而不是 reset。
-    async fn assert_rejected(frames: Vec<u8>, send_hello_first: bool) {
+    async fn assert_rejected(
+        frames: Vec<u8>,
+        send_hello_first: bool,
+        finish_after: bool,
+        expect_protocol: bool,
+    ) {
         let pair = state_pair().await;
         let (snapshot_tx, snapshot_rx) = snapshot_channel();
         let (update_tx, _update_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
+        let (farewell_tx, _farewell_rx) = mpsc::channel(1);
         let task = tokio::spawn(run_state_stream(
             pair.ours_read,
             pair.ours_write,
             None,
             snapshot_rx,
             update_tx,
+            farewell_tx,
         ));
         let mut peer_read = pair.peer_read;
         let mut peer_write = pair.peer_write;
@@ -608,12 +711,22 @@ mod tests {
                 .expect("写合法 Hello");
         }
         peer_write.write_all(&frames).await.expect("写畸形帧");
+        if finish_after {
+            peer_write.finish().expect("结束状态流发送方向");
+        }
 
         let result = task.await.expect("任务可等待");
-        assert!(
-            matches!(result, Err(TunnelError::Protocol(_))),
-            "畸形帧必须被拒绝：{result:?}"
-        );
+        if expect_protocol {
+            assert!(
+                matches!(result, Err(TunnelError::Protocol(_))),
+                "畸形帧必须被拒绝：{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(TunnelError::Network(_))),
+                "截断帧必须按读失败收尾：{result:?}"
+            );
+        }
 
         // 关闭语义：读半 stop(0x01)，写半 FIN（对端读到 EOF）。
         let (kind, _) = read_raw_frame(&mut peer_read).await;
@@ -637,7 +750,11 @@ mod tests {
     #[tokio::test]
     async fn malformed_frames_are_rejected_as_protocol_errors() {
         // 未知帧类型（0x03 已分配给 Farewell）。
-        assert_rejected(vec![0x04, 0x00, 0x00], true).await;
+        assert_rejected(vec![0x04, 0x00, 0x00], true, false, true).await;
+        // Farewell 声明非 0 payload（0x03 + 长度 1 + 1 字节）。
+        assert_rejected(vec![FRAME_FAREWELL, 0x00, 0x01, 0x00], true, false, true).await;
+        // Farewell 截断：声明 1 字节 payload，但只写帧头就 FIN。
+        assert_rejected(vec![FRAME_FAREWELL, 0x00, 0x01], true, true, false).await;
         // RuleList count 与 payload 不匹配。
         assert_rejected(
             vec![
@@ -651,6 +768,8 @@ mod tests {
                 0x00,
                 0x16,
             ],
+            true,
+            false,
             true,
         )
         .await;
@@ -672,17 +791,19 @@ mod tests {
                 0x17,
             ],
             true,
+            false,
+            true,
         )
         .await;
         // 长度字段超过 16 KiB 缓冲。
-        assert_rejected(vec![FRAME_RULE_LIST, 0xFF, 0xFF], true).await;
+        assert_rejected(vec![FRAME_RULE_LIST, 0xFF, 0xFF], true, false, true).await;
         // 首帧不是 Hello。
-        assert_rejected(encode(&RuleFrame::RuleList(Vec::new())), false).await;
+        assert_rejected(encode(&RuleFrame::RuleList(Vec::new())), false, false, true).await;
     }
 
     #[tokio::test]
     async fn wrong_hello_version_is_rejected() {
-        assert_rejected(vec![FRAME_HELLO, 0x00, 0x01, 0x02], true).await;
+        assert_rejected(vec![FRAME_HELLO, 0x00, 0x01, 0x02], true, false, true).await;
     }
 
     #[tokio::test]
@@ -690,7 +811,13 @@ mod tests {
         let (a_link, b_link) = MockLink::pair();
         let (snapshot_tx, snapshot_rx) = snapshot_channel();
         let (update_tx, mut update_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
-        let task = tokio::spawn(supervise_outbound(Arc::new(a_link), snapshot_rx, update_tx));
+        let (farewell_tx, _farewell_rx) = mpsc::channel(1);
+        let task = tokio::spawn(supervise_outbound(
+            Arc::new(a_link),
+            snapshot_rx,
+            update_tx,
+            farewell_tx,
+        ));
 
         // 第一条状态流：完成握手后由对端关闭。
         let first = b_link.accept_bi().await.expect("第一条状态流");

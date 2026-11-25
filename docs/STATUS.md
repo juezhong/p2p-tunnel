@@ -1,6 +1,6 @@
 # p2p-tunnel 状态交接
 
-> 2026-10-09 初始建档；2026-11-24 v0.1 CLI 完成；2026-11-25 真机跨平台联调通过并发布 v0.1.0；ticket 16 会话告别已实现（待合入集成分支）。以最新源码、分支、CI 与手工记录为准，不要只凭本文。
+> 2026-10-09 初始建档；2026-11-24 v0.1 CLI 完成；2026-11-25 真机跨平台联调通过并发布 v0.1.0；ticket 16 会话告别、ticket 17 告别/断链边界加固已实现并合入集成分支；2026-11-25 两轴审阅修复在 `feat/review-fixes`（待合入）。以最新源码、分支、CI 与手工记录为准，不要只凭本文。
 
 ## 2026-11-25：v0.1.0 发布与真机联调
 
@@ -30,21 +30,37 @@
 
 ## 2026-11-25：ticket 16 会话告别（Farewell）
 
-- 协议：状态帧新增 `0x03 Farewell`（payload 长度必须为 0）；首字节分流识别 `0x03`，长度非 0 按协议错误 `reset(0x01)`；状态流上收到也按正常结束。
+- 协议：状态帧新增 `0x03 Farewell`（payload 长度必须为 0）；首字节分流识别 `0x03`，长度非 0 按协议错误 `reset(0x01)`；状态流上的合法 Farewell 与专用流一致：上报告别并按 §9.5 结束会话（ticket 17）。
 - 本端退出：在已认证数据链路上新开一条 bi stream 发 `Farewell`，1 秒上限 + 等待对端关闭流 500 ms；发送失败/超时只记日志，不阻塞退出。
 - 对端退出：1 秒内打印 `[对端] 对端已退出`，RST 全部活动连接、关闭全部 listener，不进 `Reconnecting`，退出码 `0`。
 - 断链：进入 `Reconnecting` 后 5 秒未恢复即打印 `[!] 断开连接：链路重连 5 秒未恢复，会话结束`，RST 活动连接、关 listener、清理后退出 `0`；5 秒内恢复视为抖动，继续原会话。认证失败仍按会话丢失退出 `1`。
 - 清理：新增 bridge 任务登记表，退出时等待（上限 2 秒）后 abort；listener、状态流、配对任务、SDK peer 按 §9.5 收尾；退出后同一端口可立即重绑。
 - 证据：`cargo test -p tunnel-core --lib`、`--test farewell`、真实 SDK 环回告别用例；双机人工验证尚未做（见下“未验证”）。
 
+## 2026-11-25：ticket 17 告别/断链边界加固
+
+- 畸形 Farewell：长度非 0 或截断的 `0x03` 在解码阶段失败，复用 Hello/RuleList 的同一状态流失败路径——关闭状态流、发 `PeerRulesUnknown`、数据面不受影响；不产生 `PeerFarewell`/`Disconnected`/`SessionLost`，会话继续、退出码不变。
+- 数据面：注入畸形 Farewell（状态流与专用 0x03 流）后，已有 TCP 转发继续回显，新连接仍能建立；专用流畸形帧按 `reset(0x01)` 收尾。
+- 断链边界：状态流失效后真实断开链路，仍走 ticket 16 的 5 秒判定报「断开连接」退出 `0`，不误报「对端已退出」；退出后同一端口可立即重绑，无残留 listener/任务。
+- 证据：`cargo test -p tunnel-core --test farewell`（新增 4 个用例：状态流告别、状态流畸形 Farewell、专用流畸形 Farewell、状态流失效后 5 秒断链）与 `--lib` 新增 `farewell_on_state_stream_signals_session_end`、畸形 Farewell 帧拒绝用例。
+
+## 2026-11-25：两轴审阅修复（`feat/review-fixes`）
+
+- `docs/ARCHITECTURE.md` 与实现对齐：补齐 CLI `input.rs`/`output.rs` 模块、`InputEvent`/逐字节 stdin、`exit` 退出路径；会话结束按本端退出、对端 `Farewell`、5 秒断链分开描述，`SessionLost` 只对应认证失败/链路停止。
+- 退出顺序按 SPEC §9.5 改为：停 listener → reset 活动连接并等 bridge 收尾 → 发 `Farewell`（仅本端主动退出）→ 释放数据链路与 SDK peer；`Farewell` 不再在 listener 仍可接新连接时发送。
+- 结束路径抑制后续链路事件：对端 `Farewell` 或断开判定后不再发 `LinkState(Reconnecting)`/断开计时事件；`session_lost()` 更名为 `end_session()`，修复断链分支未置位结束标记的问题。
+- `Farewell` 编解码统一走 `RuleFrame::farewell_frame()`/`decode_farewell()`，删除 `rule_sync` 手工读 2 字节与 `session` 手工拼帧头。
+- 已知缺口只做文档化：Windows 无 console 输入实现（tty 清行重绘仅 unix）；CLI 双进程端到端未自动化（见下“未验证”）。
+- 证据：`cargo test --workspace` 151 passed；新增 `peer_farewell_suppresses_reconnecting_after_end`。
+
 ## 2026-11-24：v0.1 CLI 完成（ticket 10）
 
-- CLI 已完整接线：`add` / `close` / `status` / `help` / `quit`；`1`/`create`、`2`/`join` 是菜单命令别名，`3` 是 `quit` 的菜单别名（SPEC §8.1 菜单需要）。`exit`、`?` 不支持。
+- CLI 已完整接线：`add` / `close` / `status` / `help` / `quit`；`1`/`create`、`2`/`join` 是菜单命令别名，`3` 是 `quit` 的菜单别名（SPEC §8.1 菜单需要）。`exit` 已由 ticket 14 增加并与 `quit` 等价；单字符 `q`、`?` 仍不支持。
 - 配对：创建方/加入方流程、INVITE/REPLY 粘贴、比较码自动确认（v0.1 不阻塞）。`Ready` 每次配对只发一次；重连只发 `LinkState(Connected)`。
 - `status` 四段按 SPEC §8.3 输出：链路 / 本机规则 / 对端规则 / 活动连接。
 - `close` 只允许关自己的规则；成功时对本机该规则的活动 TCP 发 RST，对端打印 `[对端] 远程主动断开了 <port>`。
 - `Command::Stop` 已实现（停止监听、RST 活动连接、关闭数据链路，保留 core/进程）；v0.1 CLI 不使用。
-- 退出：`quit`/Ctrl-C/stdin EOF 发送 `Shutdown` 并排空事件，5 秒上限；退出码 `0` 正常、`1` 运行错误、`2` 参数错误。
+- 退出：`quit`/`exit`/菜单 `3`/Ctrl-C/stdin EOF 发送 `Shutdown` 并排空事件，5 秒上限；本端主动退出在已认证链路上尽力发 `Farewell`；退出码 `0` 正常、`1` 运行错误、`2` 参数错误。
 - stdin 行通道有界容量 64；`crates/tunnel-cli/tests/cli.rs` 用 3000 行输入覆盖背压。
 - 有意保留的 API 扩展：`Event::PeerRulesUnknown`、`Event::PeerRulesStale`、`TunnelError::SessionLost`，用于如实表示规则同步/链路状态。
 
@@ -56,7 +72,7 @@
 | --- | --- |
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
-| `cargo test --workspace` | **145 passed**（tunnel-core 单元 79 + `farewell` 2 + `listener_echo` 14 + `rule_sync` 8 + tunnel-cli 单元 21 + 黑盒 21） |
+| `cargo test --workspace` | **151 passed**（tunnel-core 单元 80 + `farewell` 7 + `listener_echo` 14 + `rule_sync` 8 + tunnel-cli 单元 21 + 黑盒 21） |
 | 真实 SDK 双进程环回 | 2026-11-24 ticket 06/10 手工记录（配对、双向 echo、close/RemoteClosed、审计 `result=ok`）；记录在 `.tmp/`，不提交 |
 | 退出清理与端口重绑 | core 用例 `shutdown_releases_listener_port_for_immediate_rebind`、`peer_farewell_ends_session_and_rsts_active_connections`；`listener_echo` 断开连接后立即 `bind` 同端口成功 |
 | 真机跨平台 | 见上表：macOS ↔ Windows、Termux ↔ Linux |
@@ -83,6 +99,9 @@
 | 断链 5 秒 → 退出码 0 | 由 core 单元/集成测试与真实 SDK 环回告别用例覆盖，没有双机人工记录。 |
 | 对端主动退出 → 会话结束 | **已实现**（`0x03 Farewell`）：mock 双会话与真实 SDK 环回测试覆盖；未做跨设备人工复核。 |
 | 绑定失败文案 | 由 core 单元/集成测试覆盖，未在真实端口冲突场景手工复核。 |
+| 告别帧只在状态流可用时生效 | 状态流已失败的会话收不到对端告别，仍按 ticket 16 的 5 秒断开判定处理；畸形/截断告别只让对端规则未知，不结束会话。由 ticket 17 的 core 集成测试覆盖，无双机人工记录。 |
+| Windows tty 行为 | **不具备**：没有 Windows console API 实现，CLI 走行模式，无清行重绘/半行恢复；ticket 14 的 tty 行为仅在 unix raw mode 下成立。 |
+| CLI 双进程端到端 | **未自动化**：告别/断开退出码 `0` 的双进程 CLI 端到端未写测试；现有 mock 双 `Session` 与真实 SDK 环回（同进程）覆盖 core 语义，`crates/tunnel-cli/tests/cli.rs` 只驱动单进程管道。 |
 
 ## 现在能做什么
 
@@ -93,7 +112,8 @@
 
 ## 下一任务
 
-1. issue 13：CLI 输出层与日志分流（清行重绘、空回车、`exit`/`q` 别名、默认 `warn` + `--log-file`；吸收已归档的 issue 12）。
-2. ticket 08：Windows ↔ Termux 双机验收全清单（真实 `ssh -p`、RST、端口冲突、后台限制），补本票的双机告别复核。
-3. ticket 09：真实路由器/CGNAT 记录、无中继证据。
-4. TUI（v0.2）/GUI（v0.3）不阻塞 v0.1。
+1. 合并 `feat/review-fixes`（两轴审阅修复）；补 Windows console 输入/重绘（票据 14 在 Windows 的缺口）。
+2. 补 CLI 双进程端到端自动化：告别与断链各起两个真实进程，断言文案与退出码 `0`。
+3. ticket 08：Windows ↔ Termux 双机验收全清单（真实 `ssh -p`、RST、端口冲突、后台限制），补本票的双机告别复核。
+4. ticket 09：真实路由器/CGNAT 记录、无中继证据。
+5. TUI（v0.2）/GUI（v0.3）不阻塞 v0.1。

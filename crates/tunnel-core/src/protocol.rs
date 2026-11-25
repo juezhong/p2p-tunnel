@@ -146,6 +146,27 @@ pub enum RuleFrame {
 }
 
 impl RuleFrame {
+    /// `Farewell` 的完整帧：3 字节帧头，payload 长度为 0（SPEC §5.4）。
+    ///
+    /// 发送侧直接写这份字节，避免手工拼帧头时漏掉长度字段。
+    pub const fn farewell_frame() -> [u8; FRAME_HEADER_LEN] {
+        let mut frame = [0u8; FRAME_HEADER_LEN];
+        frame[0] = FRAME_FAREWELL;
+        frame
+    }
+
+    /// 校验 `Farewell` 的 payload 长度并返回帧值。
+    ///
+    /// 完整帧解码（[`Self::decode`]）与首字节分流后的专用 `0x03` 流共用同一
+    /// 判定，避免两处各写一遍长度校验（ticket 17）。
+    pub fn decode_farewell(payload_len: usize) -> Result<Self, FrameError> {
+        if payload_len == 0 {
+            Ok(Self::Farewell)
+        } else {
+            Err(FrameError::BadFarewellLength(payload_len))
+        }
+    }
+
     /// 把整帧编码进调用方提供的缓冲，返回写入字节数。
     ///
     /// 编码不自行分配内存；缓冲不足或规则数超过帧长度上限时报错。
@@ -202,13 +223,14 @@ impl RuleFrame {
                 Ok(needed)
             }
             Self::Farewell => {
-                let needed = FRAME_HEADER_LEN;
-                if out.len() < needed {
-                    return Err(FrameError::BufferTooSmall { needed });
+                let frame = Self::farewell_frame();
+                if out.len() < frame.len() {
+                    return Err(FrameError::BufferTooSmall {
+                        needed: frame.len(),
+                    });
                 }
-                out[0] = FRAME_FAREWELL;
-                out[1..FRAME_HEADER_LEN].copy_from_slice(&0u16.to_be_bytes());
-                Ok(needed)
+                out[..frame.len()].copy_from_slice(&frame);
+                Ok(frame.len())
             }
         }
     }
@@ -277,12 +299,7 @@ impl RuleFrame {
                 }
                 Ok(Self::RuleList(rules))
             }
-            FRAME_FAREWELL => {
-                if !payload.is_empty() {
-                    return Err(FrameError::BadFarewellLength(payload.len()));
-                }
-                Ok(Self::Farewell)
-            }
+            FRAME_FAREWELL => Self::decode_farewell(payload.len()),
             other => Err(FrameError::UnknownType(other)),
         }
     }
@@ -494,9 +511,16 @@ mod tests {
     fn farewell_round_trips_with_empty_payload() {
         let bytes = encode(&RuleFrame::Farewell);
         assert_eq!(bytes, [FRAME_FAREWELL, 0x00, 0x00]);
+        assert_eq!(RuleFrame::farewell_frame(), [FRAME_FAREWELL, 0x00, 0x00]);
         assert_eq!(
             RuleFrame::decode(&bytes).expect("可解码"),
             RuleFrame::Farewell
+        );
+        // 专用 0x03 流与完整帧解码共用同一长度校验。
+        assert_eq!(RuleFrame::decode_farewell(0), Ok(RuleFrame::Farewell));
+        assert_eq!(
+            RuleFrame::decode_farewell(2),
+            Err(FrameError::BadFarewellLength(2))
         );
     }
 

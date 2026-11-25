@@ -582,6 +582,7 @@ $ p2p-tunnel
 - `Ctrl-C` 等同 `quit` / `exit`；最多等 5 秒清理，然后退出。
 - tty 下用户可见输出统一经输出层：打印事件/命令结果前清掉提示符行，打印后恢复 `> ` 与未提交的输入；连续空回车不叠加提示符。
 - tty 下逐字符读取输入（退格、`Ctrl-U`、`Ctrl-W` 可编辑），事件输出不会截断敲了一半的命令。
+- 清行重绘、半行恢复与逐字符编辑仅 unix raw mode 支持；Windows 没有等价实现（未接 console API），CLI 走行模式、无清行重绘，ticket 14 的 tty 行为在 Windows 上不成立。见 `docs/STATUS.md` 未验证表。
 - 非 tty（管道输入/输出）不发清行或光标控制序列，只输出普通换行与 `> ` 提示符。
 - 所有用户可见文案中文；日志可英文。
 
@@ -635,8 +636,8 @@ $ p2p-tunnel
 
 - 正常 TCP 半关闭：按 §5.3；两个方向都结束后 drop stream。
 - 本地 `close`：停 listener → reset 该规则连接 → 重发 `RuleList`。
-- 退出：停所有 listener → reset 所有连接 → 关闭状态流 → 发 `Farewell`（已认证链路上新开一条 bi stream，1 秒上限 + 500 ms 等待对端关闭；失败/超时不阻塞退出）→ `ManagedAuthenticatedLink::shutdown()` → 释放 SDK peer。
-- 对端 `Farewell`：不进入重连；关闭 listener、reset 活动连接、等待 bridge 任务收尾后退出 `0`。
+- 本端主动退出（`quit`/`exit`/Ctrl-C/EOF）：停所有 listener → reset 所有连接 → 关闭状态流 → 发 `Farewell`（已认证链路上新开一条 bi stream，1 秒上限 + 500 ms 等待对端关闭；失败/超时不阻塞退出）→ `ManagedAuthenticatedLink::shutdown()` → 释放 SDK peer。只有这一类退出发送 `Farewell`；对端 `Farewell`、断开连接判定与认证失败都不回发。
+- 对端 `Farewell`：不进入重连（结束路径优先于重连判定，不再上报 `Reconnecting` 或断开计时事件）；关闭 listener、reset 活动连接、等待 bridge 任务收尾后退出 `0`。
 - SDK `ConnectedTransportPeer::shutdown(self)` 消费 `self`；core 必须先 drop 所有 `Arc` clone，再 `Arc::try_unwrap`。若 `try_unwrap` 失败，至少 `bootstrap.close()` 后退出，并记录 SDK 缺口（G4）。
 - 任一时刻都不**直接**调用 `Connection::close()` 来关闭单条 TCP；会话退出由 `ManagedAuthenticatedLink::shutdown()` 负责关闭 data link。
 
