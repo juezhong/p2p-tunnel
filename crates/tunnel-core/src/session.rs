@@ -649,7 +649,11 @@ impl Worker {
                 self.link_state = Some(connected.link.subscribe_link_state());
                 self.link = Some(connected.link);
                 self.bootstrap_outbound = connected.bootstrap_outbound;
-                self.peer_session = connected.peer_session;
+                self.peer_session = connected.peer_session.clone();
+                let _ = self
+                    .events
+                    .send(Event::Connectivity(connected.connectivity))
+                    .await;
                 self.start_state_streams(lost.clone());
                 let _ = self
                     .events
@@ -1207,6 +1211,10 @@ mod tests {
                 link: Arc::new(MockLink::new()),
                 bootstrap_outbound: self.bootstrap_outbound,
                 peer_session: Arc::from("mock-session"),
+                connectivity: crate::api::Connectivity {
+                    label: "同网直连",
+                    stun_consistent: Some(true),
+                },
             })
         }
 

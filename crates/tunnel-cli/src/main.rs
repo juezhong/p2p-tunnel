@@ -449,12 +449,19 @@ fn handle_event<W: Write>(event: Event, ui: &mut UiState, out: &mut Output<W>) -
             out.line(&format!("比较码：{code}（已自动确认；v0.1 不阻塞配对）"));
             return Some(Command::ConfirmComparison);
         }
+        Event::Connectivity(connectivity) => {
+            ui.path = Some(connectivity.label);
+        }
         Event::Ready => {
             // core 只在配对完成时发一次 Ready；这里再防一层重复，避免
             // 未来事件源变化时把“配对完成”重复打印成重连提示。
             if !ui.ready_seen {
                 ui.ready_seen = true;
-                out.line("[+] 配对完成，已连接");
+                let suffix = ui
+                    .path
+                    .map(|label| format!("（{label}）"))
+                    .unwrap_or_default();
+                out.line(&format!("[+] 配对完成，已连接{suffix}"));
                 out.line("现在可用 add <本机端口> <对端端口> 新增规则，或输入 help 查看命令。");
             }
         }
@@ -593,6 +600,8 @@ struct UiState {
     exiting: bool,
     /// 已打印过“配对完成”：重连只更新链路状态，不重复打印。
     ready_seen: bool,
+    /// 连接路径摘要（不含地址）：随「配对完成」打印一次。
+    path: Option<&'static str>,
 }
 
 #[cfg(test)]

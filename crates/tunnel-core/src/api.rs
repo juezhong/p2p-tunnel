@@ -88,10 +88,21 @@ pub enum Command {
     Shutdown,
 }
 
+/// 会话建立时的路径摘要：只含类别与一致性判断，不含任何 IP/端口。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Connectivity {
+    /// `同网直连` / `NAT 打洞` / `端口映射直连` / `直连`。
+    pub label: &'static str,
+    /// `Some(true)` 映射一致，`Some(false)` 不一致，`None` 数据不足。
+    pub stun_consistent: Option<bool>,
+}
+
 /// core 发给 UI 的事件。
 #[derive(Debug, Clone)]
 pub enum Event {
     InviteCode(String),
+    /// 连接路径摘要（不含地址，SPEC §10）：UI 只展示类别，内部状态不暴露。
+    Connectivity(Connectivity),
     ReplyCode(String),
     ComparisonCode(String),
     Ready,

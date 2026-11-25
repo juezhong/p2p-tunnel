@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use p2p_sdk::ice_signaling::IceCandidateType;
+use p2p_sdk::multi_stun::MappingConsistency;
 use p2p_sdk::peer_pin::ManualConfirmation;
 use p2p_sdk::{
     begin_creator, begin_creator_auto, begin_joiner, begin_joiner_auto, ConnectedTransportPeer,
@@ -27,7 +29,7 @@ use p2p_sdk::{
 };
 use tokio::sync::watch;
 
-use crate::api::TunnelError;
+use crate::api::{Connectivity, TunnelError};
 use crate::transport::sdk::SdkManagedLink;
 use crate::transport::DataLink;
 
@@ -69,6 +71,8 @@ pub(crate) struct ConnectedLink {
     pub bootstrap_outbound: bool,
     /// 目标端审计日志用的稳定会话标识。
     pub peer_session: Arc<str>,
+    /// 路径摘要：UI 只显示类别，真实地址不落日志/界面。
+    pub connectivity: Connectivity,
 }
 
 /// 配对阶段；命令乱序时返回 `TunnelError::Pairing` 而不是隐式重置。
@@ -219,9 +223,27 @@ impl PairingDriver for SdkPairing {
         let managed = peer.manage_link();
         wait_connected(&managed).await?;
 
-        let bootstrap_outbound = peer.diagnostic().bootstrap_outbound;
+        let diagnostic = peer.diagnostic();
+        let bootstrap_outbound = diagnostic.bootstrap_outbound;
+        // SPEC §10：只暴露路径类别与一致性判断，真实地址不进日志/界面。
+        let label = match diagnostic.remote_candidate_kind {
+            Some(IceCandidateType::Host) => "同网直连",
+            Some(IceCandidateType::ServerReflexive) | Some(IceCandidateType::PeerReflexive) => {
+                "NAT 打洞"
+            }
+            Some(IceCandidateType::PortMapped) => "端口映射直连",
+            None => "直连",
+        };
+        let connectivity = Connectivity {
+            label,
+            stun_consistent: diagnostic
+                .stun_consistency
+                .map(|consistency| consistency == MappingConsistency::Consistent),
+        };
         tracing::info!(
             bootstrap_outbound,
+            path = connectivity.label,
+            stun_consistent = ?connectivity.stun_consistent,
             peer_session = %fingerprint(&comparison),
             "配对完成，managed 数据链路已连接"
         );
@@ -231,6 +253,7 @@ impl PairingDriver for SdkPairing {
             link,
             bootstrap_outbound,
             peer_session: fingerprint(&comparison),
+            connectivity,
         })
     }
 
