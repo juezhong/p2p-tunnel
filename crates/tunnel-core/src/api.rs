@@ -95,6 +95,8 @@ pub enum Event {
     ReplyCode(String),
     ComparisonCode(String),
     Ready,
+    /// 对端主动退出（收到 `Farewell`）：会话结束，UI 关闭全部连接并退出。
+    PeerFarewell,
     LinkState(LinkState),
     RulesChanged,
     /// 对端视角的规则：`listen_port` 是对端监听端口，`peer_port` 是本机目标端口。
@@ -103,6 +105,10 @@ pub enum Event {
     PeerRulesUnknown,
     /// 数据链路断开：保留最近一次对端规则，但可能已过期（`docs/SPEC.md` §9.1）。
     PeerRulesStale,
+    /// 链路重连 5 秒未恢复：按「断开连接」结束会话（`docs/SPEC.md` §9.2）。
+    ///
+    /// 不是会话丢失：UI 清理资源后以退出码 0 结束。
+    Disconnected,
     /// 对端 `RuleList` 中该 `listen_port` 消失。
     RemoteClosed {
         listen_port: u16,

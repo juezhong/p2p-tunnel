@@ -185,7 +185,7 @@ async fn run() -> ExitCode {
                         if let Some(command) = handle_event(event, &mut ui, &mut out) {
                             send(&commands, command, &mut out).await;
                         }
-                        if ui.session_lost {
+                        if ui.session_lost || ui.session_ended {
                             break;
                         }
                         out.prompt();
@@ -458,6 +458,12 @@ fn handle_event<W: Write>(event: Event, ui: &mut UiState, out: &mut Output<W>) -
                 out.line("现在可用 add <本机端口> <对端端口> 新增规则，或输入 help 查看命令。");
             }
         }
+        Event::PeerFarewell => {
+            // SPEC §9.5：对端主动退出，本端不再重连，清理后以退出码 0 结束。
+            out.line("[对端] 对端已退出");
+            ui.peer_stale = false;
+            ui.session_ended = true;
+        }
         Event::LinkState(state) => {
             ui.link = Some(state);
             ui.peer_stale = state == LinkState::Reconnecting;
@@ -489,6 +495,12 @@ fn handle_event<W: Write>(event: Event, ui: &mut UiState, out: &mut Output<W>) -
         Event::PeerRulesStale => {
             ui.peer_stale = true;
             out.line("[!] 对端规则：链路重连中，可能已过期");
+        }
+        Event::Disconnected => {
+            // SPEC §9.2：重连 5 秒未恢复按断开连接收尾，退出码 0。
+            out.line("[!] 断开连接：链路重连 5 秒未恢复，会话结束");
+            ui.peer_stale = false;
+            ui.session_ended = true;
         }
         Event::RemoteClosed { listen_port } => {
             out.line(&format!("[对端] 远程主动断开了 {listen_port}"));
@@ -575,6 +587,8 @@ struct UiState {
     awaiting: Awaiting,
     /// core 报告会话丢失（或 core 意外退出）：进程以退出码 1 结束。
     session_lost: bool,
+    /// 会话正常结束（对端退出或断链超时）：清理后以退出码 0 结束。
+    session_ended: bool,
     /// 已进入退出排空阶段：抑制 core 的收尾 Stopped 状态输出。
     exiting: bool,
     /// 已打印过“配对完成”：重连只更新链路状态，不重复打印。

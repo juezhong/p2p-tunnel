@@ -19,7 +19,7 @@ static REAL_SDK_LOCK: Mutex<()> = Mutex::const_new(());
 /// 真实 SDK 用例的等待上限（保护「链路卡死」，不是期望耗时）。
 ///
 /// 正常重连在 1–10 秒内完成。SDK 单轮拨号超时 12 秒、退避上限 5 秒，
-/// 120 秒覆盖约 7 轮重拨，并与应用层 `SESSION_LOSS_TIMEOUT` 对齐。注意
+/// 120 秒覆盖约 7 轮重拨；它只保护真实 SDK 拨号，与应用层 5 秒断链判定无关。注意
 /// 这里等的是「新认证连接出现」，不能靠调大预算去等一条可能已经被
 /// `Connected` 覆盖掉的瞬态 `Reconnecting` 阶段——那类等待永远不会被满足。
 pub(crate) const REAL_SDK_WAIT: Duration = Duration::from_secs(120);

@@ -116,6 +116,8 @@ impl From<WireError> for TunnelError {
 pub const FRAME_HELLO: u8 = 0x01;
 /// 规则同步帧类型：`RuleList`。
 pub const FRAME_RULE_LIST: u8 = 0x02;
+/// 规则同步帧类型：`Farewell`（payload 为空，表示对端主动退出）。
+pub const FRAME_FAREWELL: u8 = 0x03;
 /// 帧头长度：`type:u8 | len:u16 BE`。
 pub const FRAME_HEADER_LEN: usize = 3;
 /// `Hello` payload 长度（只有 `version:u8`）。
@@ -139,6 +141,8 @@ pub enum RuleFrame {
     Hello,
     /// 全量规则快照。
     RuleList(Vec<Forward>),
+    /// 主动退出通知：对端收到后结束会话，不再重连（SPEC §9.5）。
+    Farewell,
 }
 
 impl RuleFrame {
@@ -195,6 +199,15 @@ impl RuleFrame {
                         .copy_from_slice(&rule.peer_port.to_be_bytes());
                     offset += RULE_ENTRY_LEN;
                 }
+                Ok(needed)
+            }
+            Self::Farewell => {
+                let needed = FRAME_HEADER_LEN;
+                if out.len() < needed {
+                    return Err(FrameError::BufferTooSmall { needed });
+                }
+                out[0] = FRAME_FAREWELL;
+                out[1..FRAME_HEADER_LEN].copy_from_slice(&0u16.to_be_bytes());
                 Ok(needed)
             }
         }
@@ -264,6 +277,12 @@ impl RuleFrame {
                 }
                 Ok(Self::RuleList(rules))
             }
+            FRAME_FAREWELL => {
+                if !payload.is_empty() {
+                    return Err(FrameError::BadFarewellLength(payload.len()));
+                }
+                Ok(Self::Farewell)
+            }
             other => Err(FrameError::UnknownType(other)),
         }
     }
@@ -284,6 +303,8 @@ pub enum FrameError {
     UnsupportedVersion(u8),
     #[error("RuleList payload 长度不合法：{0}")]
     BadRuleListLength(usize),
+    #[error("Farewell payload 长度必须是 0，实际 {0}")]
+    BadFarewellLength(usize),
     #[error("RuleList count 与 payload 不匹配：count={count}，len={len}")]
     CountMismatch { count: usize, len: usize },
     #[error("RuleList 规则数超过帧长度上限：{count}")]
@@ -466,6 +487,31 @@ mod tests {
         assert_eq!(
             RuleFrame::decode(&[FRAME_HELLO, 0x00, 0x01, 0x02]).expect_err("version 必须为 1"),
             FrameError::UnsupportedVersion(0x02)
+        );
+    }
+
+    #[test]
+    fn farewell_round_trips_with_empty_payload() {
+        let bytes = encode(&RuleFrame::Farewell);
+        assert_eq!(bytes, [FRAME_FAREWELL, 0x00, 0x00]);
+        assert_eq!(
+            RuleFrame::decode(&bytes).expect("可解码"),
+            RuleFrame::Farewell
+        );
+    }
+
+    #[test]
+    fn farewell_rejects_nonempty_payload() {
+        assert_eq!(
+            RuleFrame::decode(&[FRAME_FAREWELL, 0x00, 0x01, 0x00]).expect_err("payload 必须为空"),
+            FrameError::BadFarewellLength(1)
+        );
+        assert_eq!(
+            RuleFrame::decode(&[FRAME_FAREWELL, 0x00, 0x01]).expect_err("声明长度与实际不符"),
+            FrameError::LengthMismatch {
+                declared: 1,
+                actual: 0
+            }
         );
     }
 

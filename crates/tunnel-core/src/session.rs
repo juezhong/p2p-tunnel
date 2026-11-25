@@ -8,10 +8,12 @@
 //! 规格来源：`docs/SPEC.md` §4.2、§5.2、§5.4、§6、§7.1–§7.6、§9。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -20,9 +22,9 @@ use crate::api::{Command, Event, Forward, LinkState, TunnelError};
 use crate::bridge;
 use crate::limits::StreamBudget;
 use crate::pairing::{ConnectedLink, PairingDriver, SdkPairing};
-use crate::protocol::CODE_CANCELLED;
+use crate::protocol::{RuleFrame, CODE_CANCELLED, FRAME_HEADER_LEN};
 use crate::rule_sync::{self, PeerUpdate};
-use crate::transport::DataLink;
+use crate::transport::{open_bi_with_timeout, DataLink};
 
 /// 命令通道容量。UI 是低频率的人机操作，32 足够且能自然施加背压。
 const COMMAND_CHANNEL: usize = 32;
@@ -36,8 +38,14 @@ const PAIRING_COMMAND_CHANNEL: usize = 4;
 const PAIRING_EVENT_CHANNEL: usize = 8;
 /// 重连期间新 TCP 连接等待链路恢复的上限（`docs/SPEC.md` §9.1）。
 const RECONNECT_WAIT: Duration = Duration::from_secs(5);
-/// 连续 `Reconnecting` 的上限；超过即视为会话丢失（`docs/SPEC.md` §9.2）。
-const SESSION_LOSS_TIMEOUT: Duration = Duration::from_secs(120);
+/// 连续 `Reconnecting` 的上限；超过即按「断开连接」收尾并退出 0（`docs/SPEC.md` §9.2）。
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 主动退出前发送 `Farewell` 的上限；失败/超时不阻塞退出（`docs/SPEC.md` §9.5）。
+const FAREWELL_TIMEOUT: Duration = Duration::from_secs(1);
+/// 发送 `Farewell` 后等待对端关闭流的宽限；只影响退出延迟。
+const FAREWELL_GRACE: Duration = Duration::from_millis(500);
+/// 退出时等待 bridge 任务收尾的上限。
+const TASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 配对驱动向会话上报的事件。
 enum PairingEvent {
@@ -112,7 +120,9 @@ impl Session {
         let (event_tx, event_rx) = mpsc::channel::<Event>(EVENT_CHANNEL);
         let (snapshots, _) = rule_sync::snapshot_channel();
         let (link_lost, _) = watch::channel(0u64);
+        let (farewell, farewell_events) = mpsc::channel::<()>(1);
         let budget = StreamBudget::new();
+        let tasks = TaskRegistry::new();
 
         let link_state = link.as_ref().map(|link| link.subscribe_link_state());
         let (pairing_commands, pairing_events, pairing_task) = match driver {
@@ -146,6 +156,9 @@ impl Session {
                 pairing_events,
                 pairing_task,
                 peer_session: Arc::from("unspecified"),
+                farewell,
+                farewell_events: Some(farewell_events),
+                tasks,
             }
             .run(command_rx)
             .await;
@@ -201,6 +214,49 @@ struct LocalRule {
     active: Arc<AtomicUsize>,
 }
 
+/// 本会话派生的 bridge 任务登记表；退出时统一收尾，避免任务仍持有
+/// TCP/QUIC 资源时进程就结束（`docs/SPEC.md` §9.5）。
+#[derive(Clone, Default)]
+struct TaskRegistry {
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl TaskRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 登记一个 bridge 任务；顺手清掉已经结束的句柄，避免长会话里无限累积。
+    fn spawn<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(future);
+        let mut tasks = self.tasks.lock().expect("bridge 任务登记表锁");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
+    }
+
+    /// 等待全部任务结束；超过 `limit` 仍未结束的直接 abort。
+    async fn finish_all(&self, limit: Duration) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut tasks = self.tasks.lock().expect("bridge 任务登记表锁");
+            std::mem::take(&mut *tasks)
+        };
+        let deadline = tokio::time::Instant::now() + limit;
+        for mut handle in handles {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                handle.abort();
+                continue;
+            }
+            if tokio::time::timeout(remaining, &mut handle).await.is_err() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 /// actor 内部状态；所有可变状态只在 worker task 内访问。
 struct Worker {
     link: Option<Arc<dyn DataLink>>,
@@ -224,7 +280,7 @@ struct Worker {
     link_state: Option<watch::Receiver<LinkState>>,
     /// 进入连续 `Reconnecting` 的时刻；恢复或会话结束时清空。
     reconnecting_since: Option<tokio::time::Instant>,
-    /// 会话丢失的死线（进入 `Reconnecting` 后 120 秒）。
+    /// 断开连接的判定死线（进入 `Reconnecting` 后 5 秒）。
     reconnect_deadline: Option<tokio::time::Instant>,
     /// 本侧数据流名额（listener 出站 + 目标侧入站共享）。
     budget: StreamBudget,
@@ -236,6 +292,12 @@ struct Worker {
     pairing_task: Option<JoinHandle<()>>,
     /// 目标端审计日志用的稳定会话标识（比较码派生，不含比较码本身）。
     peer_session: Arc<str>,
+    /// 对端 `Farewell` 通知的发送端（分流器 → 主循环）；保留一份避免通道关闭。
+    farewell: mpsc::Sender<()>,
+    /// 对端 `Farewell` 通知的接收端，由 [`Worker::run`] 取出轮询。
+    farewell_events: Option<mpsc::Receiver<()>>,
+    /// 本会话派生的 bridge 任务；退出时统一收尾。
+    tasks: TaskRegistry,
 }
 
 impl Worker {
@@ -248,12 +310,15 @@ impl Worker {
         }
 
         let mut updates = self.updates.take();
+        let mut farewells = self.farewell_events.take();
         let mut pairing = self.pairing_events.take();
         // 阶段订阅与 run 循环共享；在配对成功后重新取一次。
         let mut phases = self.link_state.clone();
         // `accept_bi` 循环退出（SDK 已停止）时的一次性兜底信号。
         let mut watching_loss = true;
         let mut session_lost = false;
+        // 对端主动 Farewell：本端不发送告别、也不进入重连。
+        let mut peer_exited = false;
         loop {
             tokio::select! {
                 command = commands.recv() => {
@@ -303,15 +368,29 @@ impl Worker {
                         updates = self.updates.take();
                     }
                 }
+                signal = recv_optional(farewells.as_mut()), if farewells.is_some() => {
+                    if signal.is_some() {
+                        self.handle_peer_farewell().await;
+                        peer_exited = true;
+                        break;
+                    }
+                    farewells = None;
+                }
                 _ = reconnect_timeout(self.reconnect_deadline), if self.reconnect_deadline.is_some() => {
-                    tracing::warn!("连续 120 秒未能恢复数据链路");
+                    // SPEC §9.2：重连 5 秒未恢复即按「断开连接」收尾，
+                    // 退出码 0，不再等 120 秒报「会话丢失」。
+                    tracing::warn!("数据链路重连 5 秒未恢复，按断开连接退出");
+                    let _ = self.events.send(Event::Disconnected).await;
                     self.session_lost();
-                    session_lost = true;
                     break;
                 }
             }
         }
 
+        // 主动退出时尽力通知对端；链路已断或无对端时跳过，绝不阻塞退出。
+        if !session_lost && !peer_exited {
+            self.send_farewell().await;
+        }
         self.stop_all().await;
         if session_lost {
             let _ = self
@@ -328,8 +407,8 @@ impl Worker {
             LinkState::Connected => {
                 if self.reconnecting_since.take().is_some() {
                     tracing::info!("数据链路已恢复");
-                    // 健康重连必须撤销 120 秒会话丢失倒计时（§9.1、§9.2）；
-                    // 否则一次 5 秒闪断会在 120 秒后误杀已恢复的会话。
+                    // 5 秒内恢复（抖动）必须撤销断开倒计时（§9.1、§9.2）；
+                    // 否则一次闪断会在恢复后误杀会话。
                     self.reconnect_deadline = None;
                     self.restart_state_streams(lost.clone()).await;
                     // 新链路上重发 Hello + 全量 RuleList（§5.4、§9.1）。
@@ -379,7 +458,7 @@ impl Worker {
         }
         let now = tokio::time::Instant::now();
         self.reconnecting_since = Some(now);
-        self.reconnect_deadline = Some(now + SESSION_LOSS_TIMEOUT);
+        self.reconnect_deadline = Some(now + DISCONNECT_TIMEOUT);
         tracing::warn!("数据链路已断开，等待 SDK 重连");
         // 代数 +1：所有旧连接在 wait_abort 中看到代数变化后 RST 本地 TCP。
         let generation = *self.link_lost.borrow() + 1;
@@ -391,6 +470,59 @@ impl Worker {
             .events
             .send(Event::LinkState(LinkState::Reconnecting))
             .await;
+    }
+
+    /// 主动退出前尽力发送一次 `Farewell`；失败或超时都不阻塞退出。
+    ///
+    /// 仅在数据链路仍为 `Connected` 时尝试：断链/重连中本端已经没有可用
+    /// 的数据面，发送只会白白等满上限（SPEC §9.5）。
+    async fn send_farewell(&mut self) {
+        let Some(link) = self.link.clone() else {
+            return;
+        };
+        if !self.is_link_connected() {
+            tracing::debug!("数据链路不可用，跳过发送 Farewell");
+            return;
+        }
+        let attempt = tokio::time::timeout(FAREWELL_TIMEOUT, async {
+            let stream = open_bi_with_timeout(&*link).await?;
+            let (mut read, mut write) = stream.split();
+            let mut frame = [0u8; FRAME_HEADER_LEN];
+            let len = RuleFrame::Farewell.encode(&mut frame)?;
+            write
+                .write_all(&frame[..len])
+                .await
+                .map_err(|error| TunnelError::Network(format!("发送 Farewell 失败：{error}")))?;
+            write.finish()?;
+            // 等对端读到 Farewell 并关闭流，缩小「对端先看到断链」的竞态。
+            let mut scratch = [0u8; 8];
+            let _ = tokio::time::timeout(FAREWELL_GRACE, read.read(&mut scratch)).await;
+            Ok::<(), TunnelError>(())
+        })
+        .await;
+        match attempt {
+            Ok(Ok(())) => tracing::info!("已发送 Farewell"),
+            Ok(Err(error)) => tracing::debug!(%error, "发送 Farewell 失败，继续退出"),
+            Err(_) => tracing::debug!("发送 Farewell 超时，继续退出"),
+        }
+    }
+
+    /// 当前数据链路是否处于 `Connected`；没有链路订阅时视为不可用。
+    fn is_link_connected(&self) -> bool {
+        self.link_state
+            .as_ref()
+            .map(|state| *state.borrow() == LinkState::Connected)
+            .unwrap_or(false)
+    }
+
+    /// 对端主动退出：不进入重连，直接结束会话（SPEC §9.5）。
+    ///
+    /// 先上报 [`Event::PeerFarewell`]，让 UI 尽快打印「对端已退出」，随后由
+    /// `run` 的收尾流程关闭 listener、RST 活动连接并释放链路。
+    async fn handle_peer_farewell(&mut self) {
+        tracing::info!("收到对端 Farewell，会话结束");
+        let _ = self.events.send(Event::PeerFarewell).await;
+        self.session_lost();
     }
 
     /// 终止当前链路代的规则同步任务；重连后由 [`Self::restart_state_streams`] 重开。
@@ -526,6 +658,7 @@ impl Worker {
         let demux = rule_sync::spawn_demux(
             link.clone(),
             state_tx,
+            self.farewell.clone(),
             self.link_lost.subscribe(),
             self.budget.clone(),
             self.peer_session.clone(),
@@ -644,6 +777,7 @@ impl Worker {
                     .clone()
                     .unwrap_or_else(|| watch::channel(LinkState::Connected).1),
                 budget: self.budget.clone(),
+                tasks: self.tasks.clone(),
             },
             active.clone(),
             stop_rx,
@@ -725,6 +859,8 @@ impl Worker {
 
     async fn stop_all(&mut self) {
         self.stop_listeners("退出时关闭规则").await;
+        // 等 bridge 任务把 RST 写到本地 TCP 并释放数据流名额，再拆链路。
+        self.tasks.finish_all(TASK_CLEANUP_TIMEOUT).await;
         self.abort_state_streams().await;
         // 先释放数据链路：drop 会让 SDK managed link 的 worker 停止。
         self.link = None;
@@ -862,6 +998,7 @@ struct ListenerShared {
     link_lost: watch::Receiver<u64>,
     link_state: watch::Receiver<LinkState>,
     budget: StreamBudget,
+    tasks: TaskRegistry,
 }
 
 /// 本机 listener 的 accept 循环：每条 TCP 启动一个 bridge 任务。
@@ -910,7 +1047,7 @@ async fn run_listener(
                 let close = shared.close.clone();
                 let link_lost = shared.link_lost.clone();
                 let link_state = shared.link_state.clone();
-                tokio::spawn(async move {
+                shared.tasks.spawn(async move {
                     bridge_local(tcp, forward, link, events, close, link_lost, link_state).await;
                     active.fetch_sub(1, Ordering::SeqCst);
                     drop(slot);
@@ -1163,6 +1300,9 @@ mod tests {
             pairing_events: None,
             pairing_task: None,
             peer_session: Arc::from("test-session"),
+            farewell: mpsc::channel(1).0,
+            farewell_events: None,
+            tasks: TaskRegistry::new(),
         };
 
         worker
@@ -1328,7 +1468,8 @@ mod tests {
         Box::new(SdkPairing::with_interfaces(vec![address]))
     }
 
-    async fn real_sdk_loopback() {
+    /// 真实 SDK 环回：走完 INVITE/REPLY → 比较码 → Ready，返回两端。
+    async fn loopback_ready_sessions() -> (Session, Session) {
         let mut creator = Session::spawn_with_pairing(loopback_pairing());
         let mut joiner = Session::spawn_with_pairing(loopback_pairing());
 
@@ -1388,6 +1529,33 @@ mod tests {
             .expect("channel open");
         next_ok(&mut creator, |event| matches!(event, Event::Ready)).await;
         next_ok(&mut joiner, |event| matches!(event, Event::Ready)).await;
+        (creator, joiner)
+    }
+
+    /// 真实 SDK 环回：主动退出的 Farewell 必须让对端 1 秒内结束会话。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_sdk_loopback_peer_farewell_ends_session() {
+        let _serial = real_sdk_guard().await;
+        tokio::time::timeout(REAL_SDK_WAIT, async {
+            let (creator, mut joiner) = loopback_ready_sessions().await;
+            creator.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                next_ok(&mut joiner, |event| matches!(event, Event::PeerFarewell)).await;
+                next_ok(&mut joiner, |event| {
+                    matches!(event, Event::LinkState(LinkState::Stopped))
+                })
+                .await;
+            })
+            .await
+            .expect("对端应在 1 秒内识别 Farewell（允许 2 秒调度余量）");
+            joiner.shutdown().await;
+        })
+        .await
+        .expect("真实 SDK 告别超时");
+    }
+
+    async fn real_sdk_loopback() {
+        let (mut creator, mut joiner) = loopback_ready_sessions().await;
 
         let echo_a = spawn_echo().await;
         let echo_b = spawn_echo().await;
@@ -1497,7 +1665,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn healthy_reconnect_clears_session_loss_deadline() {
+    async fn reconnect_recovered_within_five_seconds_cancels_disconnect() {
         let link = Arc::new(MockLink::new());
         let mut session = Session::spawn_with_link(link.clone());
         next_matching(&mut session, |event| matches!(event, Event::Ready)).await;
@@ -1508,17 +1676,17 @@ mod tests {
         })
         .await;
 
-        // 闪断 5 秒后恢复。
-        tokio::time::advance(Duration::from_secs(5)).await;
+        // 4 秒内恢复：属于抖动，不能触发 5 秒断开兜底。
+        tokio::time::advance(Duration::from_secs(4)).await;
         link.set_phase(LinkState::Connected);
         next_matching(&mut session, |event| {
             matches!(event, Event::LinkState(LinkState::Connected))
         })
         .await;
 
-        // 若恢复时没有清除 120 秒倒计时，worker 会在下面让出执行权时
-        // 立刻判定会话丢失并退出，sender 随之关闭。
-        tokio::time::advance(Duration::from_secs(121)).await;
+        // 若恢复时没有清除 5 秒倒计时，worker 会在这里判定断开并退出，
+        // 下面的 AddForward 与哨兵事件都拿不到。
+        tokio::time::advance(Duration::from_secs(6)).await;
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
@@ -1530,13 +1698,134 @@ mod tests {
                 peer_port: 22,
             }))
             .await
-            .expect("恢复 120 秒后会话应仍然存活");
+            .expect("恢复 5 秒内后会话应仍然存活");
         next_matching(
             &mut session,
             |event| matches!(event, Event::ListenerStarted(port) if *port == listen_port),
         )
         .await;
         session.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnecting_past_five_seconds_ends_session_as_disconnected() {
+        let link = Arc::new(MockLink::new());
+        let mut session = Session::spawn_with_link(link.clone());
+        next_matching(&mut session, |event| matches!(event, Event::Ready)).await;
+
+        link.set_phase(LinkState::Reconnecting);
+        next_matching(&mut session, |event| {
+            matches!(event, Event::LinkState(LinkState::Reconnecting))
+        })
+        .await;
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        // 断开连接不是会话丢失：先报 Disconnected，再报 Stopped，然后退出。
+        next_matching(&mut session, |event| matches!(event, Event::Disconnected)).await;
+        next_matching(&mut session, |event| {
+            matches!(event, Event::LinkState(LinkState::Stopped))
+        })
+        .await;
+        let trailing = tokio::time::timeout(Duration::from_secs(1), session.recv()).await;
+        assert!(
+            matches!(trailing, Ok(None)),
+            "断开连接后 worker 应立即退出，实际 {trailing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_farewell_ends_session_and_rsts_active_connections() {
+        let (link_a, link_b) = MockLink::pair();
+        let mut a = Session::spawn_with_link(Arc::new(link_a));
+        let mut b = Session::spawn_with_link(Arc::new(link_b));
+        next_matching(&mut a, |event| matches!(event, Event::Ready)).await;
+        next_matching(&mut b, |event| matches!(event, Event::Ready)).await;
+
+        let echo_port = spawn_echo().await;
+        let listen_port = free_port();
+        b.sender()
+            .send(Command::AddForward(Forward {
+                listen_port,
+                peer_port: echo_port,
+            }))
+            .await
+            .expect("channel open");
+        next_matching(
+            &mut b,
+            |event| matches!(event, Event::ListenerStarted(port) if *port == listen_port),
+        )
+        .await;
+
+        let mut client = TcpStream::connect(("127.0.0.1", listen_port))
+            .await
+            .expect("连接本机 listener");
+        client.write_all(b"hello").await.expect("写入");
+        let mut buffer = [0u8; 5];
+        let read = tokio::time::timeout(Duration::from_secs(10), client.read(&mut buffer))
+            .await
+            .expect("等待回显超时")
+            .expect("读取回显");
+        assert_eq!(&buffer[..read], b"hello");
+
+        // A 主动退出 → B 1 秒内报告对端已退出，且不进入重连。
+        a.shutdown().await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            next_matching(&mut b, |event| matches!(event, Event::PeerFarewell)),
+        )
+        .await
+        .expect("对端应在 1 秒内收到 Farewell");
+
+        // 活动 TCP 必须被 RST（读到 EOF 或连接重置都说明已收尾）。
+        let mut tail = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.read(&mut tail)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "活动连接应被关闭，实际 {closed:?}"
+        );
+
+        next_matching(&mut b, |event| {
+            matches!(event, Event::LinkState(LinkState::Stopped))
+        })
+        .await;
+        let trailing = tokio::time::timeout(Duration::from_secs(1), b.recv()).await;
+        assert!(
+            matches!(trailing, Ok(None)),
+            "对端告别后 worker 应退出，实际 {trailing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_listener_port_for_immediate_rebind() {
+        let link = Arc::new(MockLink::new());
+        let mut session = Session::spawn_with_link(link);
+        next_matching(&mut session, |event| matches!(event, Event::Ready)).await;
+
+        let listen_port = free_port();
+        session
+            .sender()
+            .send(Command::AddForward(Forward {
+                listen_port,
+                peer_port: 22,
+            }))
+            .await
+            .expect("channel open");
+        next_matching(
+            &mut session,
+            |event| matches!(event, Event::ListenerStarted(port) if *port == listen_port),
+        )
+        .await;
+
+        session.shutdown().await;
+
+        // 退出清理必须已经释放 listener，同一端口可以立即重绑。
+        let rebound = TcpListener::bind(("127.0.0.1", listen_port)).await;
+        assert!(
+            rebound.is_ok(),
+            "退出后应立即能重绑端口 {listen_port}：{:?}",
+            rebound.err()
+        );
     }
 
     #[tokio::test]

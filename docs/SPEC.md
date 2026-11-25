@@ -201,13 +201,14 @@ B: tunnel-core ── accept_bi ── 拨 127.0.0.1:22
 2. 读第一字节：
    - `0x50` (`P`) → 数据流；继续读 5 字节头。
    - `0x01` / `0x02` → 规则同步流帧；交给状态流处理。
+   - `0x03` → 会话告别（Farewell）：再读 2 字节长度，必须为 0；随后结束会话（不 reset、不进入重连）。
    - 其他 → `reset(0x01)`，继续 accept。
 3. 数据流：校验头；校验失败 → `reset(0x01)`。
 4. 并发检查：该目标端口活动连接数 ≥64，或本侧总数 ≥96 → `reset(0x04)`。
 5. `timeout(10s, TcpStream::connect(("127.0.0.1", port)))`；失败 → `reset(0x02)`。
 6. 进入双泵；记录审计日志。
 
-> 第一字节分流是必要的：规则同步流也是 bi stream，和数据流共用 `accept_bi()`。数据流首字节固定 `0x50`，状态帧首字节固定 `0x01/0x02`，不会冲突。
+> 第一字节分流是必要的：规则同步流也是 bi stream，和数据流共用 `accept_bi()`。数据流首字节固定 `0x50`，状态帧首字节固定 `0x01/0x02/0x03`，不会冲突。
 
 ### 5.3 半关闭、RST、STOP
 
@@ -241,12 +242,14 @@ B: tunnel-core ── accept_bi ── 拨 127.0.0.1:22
 frame  := type:u8 | len:u16 BE | payload[len]
 type 0x01 Hello    payload := version:u8 (0x01)
 type 0x02 RuleList payload := count:u16 BE | count * (listen_port:u16 BE, peer_port:u16 BE)
+type 0x03 Farewell payload := (空)
 ```
 
-- `len` 是 payload 长度；Hello 的 `len == 1`；RuleList 的 `len == 2 + 4 * count`。
+- `len` 是 payload 长度；Hello 的 `len == 1`；RuleList 的 `len == 2 + 4 * count`；Farewell 的 `len == 0`。
 - `RuleList` 是**全量快照**，不是增量。
 - `listen_port` 在同一个 `RuleList` 内必须唯一；重复 → 状态流协议错误。
 - 收到未知 type、长度不匹配、version 不匹配 → 关闭状态流，标记“对端规则未知”；**不影响数据流**。
+- `Farewell` 表示对端主动退出会话：收到后立即按 §9.5 结束本端会话（关闭 listener、reset 活动连接、退出 0），**不进入重连**。`Farewell` 也可以出现在状态流上，收到同样按正常结束处理。
 - 任一侧 `add` / `close` 后重发完整 `RuleList`。
 - 状态流失败（数据链路仍存活）：数据继续；`status` 显示“对端规则未知”；由 `bootstrap_outbound` 侧重开状态流并重发。
 - 数据链路断开：没有状态流；保留最后已知对端规则并标记“可能过期”；重连后以新 `RuleList` 为准，缺失项触发 `RemoteClosed`。
@@ -286,7 +289,8 @@ type 0x02 RuleList payload := count:u16 BE | count * (listen_port:u16 BE, peer_p
 | 数据流头读取 | 5 s | 目标端 |
 | 目标拨号 | 10 s | `127.0.0.1:port` |
 | 重连期间新 TCP 等待 | 5 s | 等不到 `current()` 就关闭 |
-| 会话丢失判定 | 120 s | 连续 Reconnecting 且无 Connected；或 AuthenticationFailed |
+| 断开连接判定 | 5 s | 连续 Reconnecting 且无 Connected；超时按「断开连接」退出 0（不是会话丢失） |
+| 会话丢失判定 | AuthenticationFailed | 认证失败仍按会话丢失处理（退出 1） |
 | QUIC keepalive / idle | 10 s / 120 s | SDK 固定，应用不可调 |
 | 应用层 TCP idle timeout | 无 | 避免杀掉空闲 SSH；链路死亡由 QUIC 检测 |
 
@@ -405,10 +409,13 @@ Idle
                                                   ▼
                                             Reconnecting
                                               │        │
-                                     Connected│        │120s / AuthFailed
+                                     Connected│        │5s / AuthFailed
                                               ▼        ▼
                                             Ready    Stopped
 ```
+
+- 连续 `Reconnecting` 5 秒未恢复：打印「断开连接」、reset 活动连接、关闭 listener，退出 0；只有 `AuthenticationFailed` 才按“会话丢失”退出 1。
+- 对端主动退出（`Farewell`）：直接 `Stopped`，不经过 `Reconnecting`。
 
 - `Ready` 之前不接受 `AddForward`（返回 `Error`），避免 listener 在无链路时启动。
 - `Ready` 后 listener 常驻；即使本端没有规则，也运行 `accept_bi()` 循环，以便对端访问本端任意 loopback 端口。
@@ -542,6 +549,18 @@ $ p2p-tunnel
 > quit
 ```
 
+对端主动退出或本地断链 5 秒未恢复时：
+
+```text
+[对端] 对端已退出
+已退出。
+```
+
+```text
+[!] 断开连接：链路重连 5 秒未恢复，会话结束
+已退出。
+```
+
 ### 8.4 状态与错误展示
 
 - 链路状态变化：`连接中` / `已连接` / `重连中` / `认证失败` / `已停止`。
@@ -550,6 +569,9 @@ $ p2p-tunnel
 - 绑定失败：`[!] 无法监听 127.0.0.1:<port>：<原因>`。
 - 目标拨号失败：只影响该 TCP 连接；日志/状态不报“会话失败”。
 - 对端 close：`[对端] 远程主动断开了 <port>`。
+- 对端主动退出：`[对端] 对端已退出`，清理后退出码 `0`。
+- 链路重连 5 秒未恢复：`[!] 断开连接：链路重连 5 秒未恢复，会话结束`，清理后退出码 `0`。
+- 会话丢失（仅认证失败）：`[!] 会话丢失，请重新配对`，退出码 `1`。
 - 本端 close 不存在：`[!] 没有本机规则监听 <port>`。
 - 端口非法：`[!] 端口必须是 1–65535`。
 - 退出码：`0` 正常；`1` 运行错误；`2` 参数错误。
@@ -580,13 +602,18 @@ $ p2p-tunnel
 5. SDK 自动重拨/重新认证（500 ms → 5 s backoff）；每次重连都重新走 mTLS PIN + 会话 HMAC。
 6. 新 `Connected`：启动新的 accept loop；`bootstrap_outbound` 侧重开状态流；重发 `Hello` + `RuleList`；`LinkState(Connected)`。
 
-### 9.2 会话丢失
+### 9.2 断开连接与会话丢失
 
-- 连续 `Reconnecting` 超过 **120 秒**，或 `ManagedLinkPhase::AuthenticationFailed`：
+- 连续 `Reconnecting` 超过 **5 秒** 仍未恢复：
   - 关闭所有 listener；
-  - reset 所有活动连接；
-  - `LinkState(AuthenticationFailed/Stopped)` + `Error`；
-  - CLI 显示“会话丢失，请重新配对”。
+  - reset 所有活动连接并等待 bridge 任务收尾；
+  - `Event::Disconnected` + `LinkState(Stopped)`；
+  - CLI 打印「断开连接」后清理并退出 `0`；**不报“会话丢失”**。
+- `ManagedLinkPhase::AuthenticationFailed` 仍按会话丢失处理：
+  - 关闭所有 listener、reset 所有活动连接；
+  - `LinkState(AuthenticationFailed/Stopped)` + `Error::SessionLost`；
+  - CLI 显示“会话丢失，请重新配对”，退出 `1`。
+- 5 秒内恢复 `Connected` 视为抖动：清除倒计时，继续使用原会话，不退出。
 - 不伪造无缝恢复；不自动重新配对。
 
 ### 9.3 bootstrap 断开
@@ -608,7 +635,8 @@ $ p2p-tunnel
 
 - 正常 TCP 半关闭：按 §5.3；两个方向都结束后 drop stream。
 - 本地 `close`：停 listener → reset 该规则连接 → 重发 `RuleList`。
-- 退出：停所有 listener → reset 所有连接 → 关闭状态流 → `ManagedAuthenticatedLink::shutdown()` → 释放 SDK peer。
+- 退出：停所有 listener → reset 所有连接 → 关闭状态流 → 发 `Farewell`（已认证链路上新开一条 bi stream，1 秒上限 + 500 ms 等待对端关闭；失败/超时不阻塞退出）→ `ManagedAuthenticatedLink::shutdown()` → 释放 SDK peer。
+- 对端 `Farewell`：不进入重连；关闭 listener、reset 活动连接、等待 bridge 任务收尾后退出 `0`。
 - SDK `ConnectedTransportPeer::shutdown(self)` 消费 `self`；core 必须先 drop 所有 `Arc` clone，再 `Arc::try_unwrap`。若 `try_unwrap` 失败，至少 `bootstrap.close()` 后退出，并记录 SDK 缺口（G4）。
 - 任一时刻都不**直接**调用 `Connection::close()` 来关闭单条 TCP；会话退出由 `ManagedAuthenticatedLink::shutdown()` 负责关闭 data link。
 
@@ -647,6 +675,9 @@ $ p2p-tunnel
 | Mock 集成 | `open_bi` 挂起→5 s 超时；64 并发上限；96 总上限 | M1 | CI |
 | Mock 集成 | 动态 add/close 多规则；close 一条不影响另一条 | M1 | CI |
 | Mock 集成 | 对端 RuleList 删除→`RemoteClosed`；状态流失败→数据继续 | M1 | CI |
+| Mock 集成 | `Farewell`：对端 1 秒内结束、RST 活动连接、退出后端口可重绑 | M1 | CI |
+| Mock 集成 | 连续 Reconnecting 5 s 未恢复→`Disconnected` 退出 0；5 s 内恢复继续 | M1 | CI |
+| 真实 SDK 环回 | 主动退出 `Farewell` → 对端 1 秒内 `PeerFarewell` 并结束 | M2 | CI |
 | 真实 SDK 环回 | 配对→bootstrap→manage_link→状态流→两条 data stream | M2 | 手工/CI |
 | 真实 SDK 环回 | 双向同时；关闭一条规则不影响另一条 | M2 | 手工/CI |
 | 真实 SDK 环回 | 数据链路断开→listener 保持→新连接恢复；活动连接 RST | M2/M3 | 手工/CI |

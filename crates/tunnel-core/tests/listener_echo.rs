@@ -768,10 +768,10 @@ async fn hanging_open_bi_times_out_and_closes_tcp_without_reconnecting() {
 // Ticket 07：数据链路重连与失败处理
 // ---------------------------------------------------------------------------
 
-/// 重连期间新 TCP 最多等待 5 秒；超时关闭该连接并上报明确错误，
-/// 但监听器必须保持绑定。
+/// 重连期间新 TCP 仍会被接受，但会话在 5 秒断链上限处收尾：
+/// 客户端连接被关闭，随后上报 `Disconnected` 并以退出码 0 结束。
 #[tokio::test]
-async fn new_tcp_during_reconnect_waits_five_seconds_then_closes() {
+async fn new_tcp_during_reconnect_closes_at_disconnect_deadline() {
     let (echo_port, _echo) = spawn_echo_server().await;
     let link = Arc::new(MockLink::new());
     let mut session = ready_session(link.clone()).await;
@@ -785,7 +785,6 @@ async fn new_tcp_during_reconnect_waits_five_seconds_then_closes() {
     })
     .await;
 
-    let started = tokio::time::Instant::now();
     let mut client = TcpStream::connect(("127.0.0.1", listen_port))
         .await
         .expect("重连期间 listener 仍应接受连接");
@@ -797,31 +796,28 @@ async fn new_tcp_during_reconnect_waits_five_seconds_then_closes() {
     let mut buffer = [0u8; 1];
     let read = tokio::time::timeout(Duration::from_secs(8), client.read(&mut buffer))
         .await
-        .expect("重连等待超时后应关闭该 TCP")
-        .expect("读取客户端");
-    assert_eq!(read, 0, "重连等待超时后客户端应读到 EOF");
+        .expect("会话应在 5 秒断链上限处关闭该 TCP");
     assert!(
-        started.elapsed() >= Duration::from_millis(4900),
-        "新 TCP 应等待接近 5 秒再关闭，实际 {:?}",
-        started.elapsed()
+        matches!(read, Ok(0) | Err(_)),
+        "客户端连接应被关闭，实际 {read:?}"
     );
 
-    let error = wait_for(&mut session, |event| matches!(event, Event::Error(_))).await;
-    let Event::Error(error) = error else {
-        panic!("期望 Error 事件");
-    };
+    wait_for(&mut session, |event| matches!(event, Event::Disconnected)).await;
+    wait_for(&mut session, |event| {
+        matches!(event, Event::LinkState(LinkState::Stopped))
+    })
+    .await;
     assert!(
-        error.to_string().contains("等待数据链路重连"),
-        "错误应说明链路仍在重连: {error}"
+        session.recv().await.is_none(),
+        "断开连接后 core 应退出并关闭事件通道"
     );
 
-    // 监听器没有被关闭：仍可完成一次 TCP 握手。
-    let probe = TcpStream::connect(("127.0.0.1", listen_port))
-        .await
-        .expect("重连期间 listener 必须保持绑定");
-    drop(probe);
-
-    session.shutdown().await;
+    let rebound = TcpListener::bind(("127.0.0.1", listen_port)).await;
+    assert!(
+        rebound.is_ok(),
+        "断开连接后 listener 应关闭，端口 {listen_port} 可重绑：{:?}",
+        rebound.err()
+    );
 }
 
 /// 链路恢复后：重开状态流、重发 RuleList、回到 Ready 并恢复转发。
@@ -931,11 +927,11 @@ async fn authentication_failure_ends_session_with_reconnect_message() {
     );
 }
 
-/// 连续 120 秒未能恢复连接 → 会话丢失。
+/// 连续 5 秒未能恢复连接 → 按「断开连接」退出 0（不是会话丢失）。
 ///
-/// 使用暂停时钟避免真实等待 120 秒；超时路径只依赖 `tokio::time`。
+/// 使用暂停时钟避免真实等待 5 秒；超时路径只依赖 `tokio::time`。
 #[tokio::test(start_paused = true)]
-async fn reconnecting_for_120_seconds_ends_session() {
+async fn reconnecting_past_five_seconds_reports_disconnected() {
     let link = Arc::new(MockLink::new());
     let mut session = ready_session(link.clone()).await;
 
@@ -945,21 +941,27 @@ async fn reconnecting_for_120_seconds_ends_session() {
     })
     .await;
 
-    let error = tokio::time::timeout(Duration::from_secs(300), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match session.recv().await {
-                Some(Event::Error(error)) => return error,
+                Some(Event::Disconnected) => return,
+                Some(Event::Error(error)) => {
+                    panic!("5 秒断链不应报会话丢失：{error}")
+                }
                 Some(_) => continue,
                 None => panic!("core 提前退出"),
             }
         }
     })
     .await
-    .expect("120 秒重连超时应触发会话丢失");
-    assert_eq!(error.to_string(), "会话丢失，请重新配对");
+    .expect("5 秒重连超时应触发断开连接");
 
     wait_for(&mut session, |event| {
         matches!(event, Event::LinkState(LinkState::Stopped))
     })
     .await;
+    assert!(
+        session.recv().await.is_none(),
+        "断开连接后 core 应退出并关闭事件通道"
+    );
 }

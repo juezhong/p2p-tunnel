@@ -93,7 +93,7 @@ async fn read_rule_list(read: &mut Box<dyn TunnelRead>) -> Vec<Forward> {
     frame.extend_from_slice(&payload);
     match RuleFrame::decode(&frame).expect("解码 RuleList") {
         RuleFrame::RuleList(rules) => rules,
-        RuleFrame::Hello => panic!("期望 RuleList"),
+        RuleFrame::Hello | RuleFrame::Farewell => panic!("期望 RuleList"),
     }
 }
 
@@ -586,7 +586,10 @@ async fn run_malformed_case(bad: Vec<u8>) {
 #[tokio::test]
 async fn malformed_state_frames_are_rejected_but_data_keeps_flowing() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
-        ("未知帧类型", vec![0x03, 0x00, 0x00]),
+        (
+            "未知帧类型（0x03 已分配给 Farewell）",
+            vec![0x04, 0x00, 0x00],
+        ),
         (
             "RuleList count 与 payload 不符",
             vec![

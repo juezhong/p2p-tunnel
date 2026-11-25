@@ -1,6 +1,6 @@
 # p2p-tunnel 状态交接
 
-> 2026-10-09 初始建档；2026-11-24 v0.1 CLI 完成；2026-11-25 真机跨平台联调通过并发布 v0.1.0。以最新源码、分支、CI 与手工记录为准，不要只凭本文。
+> 2026-10-09 初始建档；2026-11-24 v0.1 CLI 完成；2026-11-25 真机跨平台联调通过并发布 v0.1.0；ticket 16 会话告别已实现（待合入集成分支）。以最新源码、分支、CI 与手工记录为准，不要只凭本文。
 
 ## 2026-11-25：v0.1.0 发布与真机联调
 
@@ -16,7 +16,7 @@
 
 ### 真机联调暴露的问题（已记录，下一版处理）
 
-1. **对端退出后仍重连**：一端 `quit`，另一端进入 `重连中` 并等满 120 秒才报会话丢失。两端都主动退出时不需要重连，需要会话级告别（见 `.scratch` issue 11）。
+1. **对端退出后仍重连**：一端 `quit`，另一端进入 `重连中` 并等满 120 秒才报会话丢失。两端都主动退出时不需要重连，需要会话级告别（见 `.scratch` issue 11）。**已由 ticket 16 修复**：新增 `0x03 Farewell`，对端 1 秒内结束并退出 0；断链改为 5 秒未恢复即“断开连接”退出 0。
 2. **提示符与日志交错**：空回车会重复打印 `> `；`INFO` 审计行落在提示符之后，界面显乱（见 issue 13，已吸收 12）。
 3. **没有 `exit` 别名**：用户输入 `exit` 得到未知命令（issue 13）。
 4. 活动连接只在拥有规则的一侧显示；对端侧只看到审计日志，容易被误读为“没有连接”。
@@ -27,6 +27,15 @@
 - 逐条连接建立/关闭不再打印，连接数只在 `status` 的活动连接里体现。
 - quinn 的 `UDP demultiplexer shut down` 属配对后关闭 bootstrap 的预期噪声，默认过滤；tracing 改走 stderr。
 - 新增 Android aarch64 产物（NDK r28、bionic、PIE；二进制品无 TLS 段，因此不受 64 字节对齐限制）。Termux 不能用 linux-musl（非 PIE）或 linux-gnu（glibc TLS 对齐 8 字节）。
+
+## 2026-11-25：ticket 16 会话告别（Farewell）
+
+- 协议：状态帧新增 `0x03 Farewell`（payload 长度必须为 0）；首字节分流识别 `0x03`，长度非 0 按协议错误 `reset(0x01)`；状态流上收到也按正常结束。
+- 本端退出：在已认证数据链路上新开一条 bi stream 发 `Farewell`，1 秒上限 + 等待对端关闭流 500 ms；发送失败/超时只记日志，不阻塞退出。
+- 对端退出：1 秒内打印 `[对端] 对端已退出`，RST 全部活动连接、关闭全部 listener，不进 `Reconnecting`，退出码 `0`。
+- 断链：进入 `Reconnecting` 后 5 秒未恢复即打印 `[!] 断开连接：链路重连 5 秒未恢复，会话结束`，RST 活动连接、关 listener、清理后退出 `0`；5 秒内恢复视为抖动，继续原会话。认证失败仍按会话丢失退出 `1`。
+- 清理：新增 bridge 任务登记表，退出时等待（上限 2 秒）后 abort；listener、状态流、配对任务、SDK peer 按 §9.5 收尾；退出后同一端口可立即重绑。
+- 证据：`cargo test -p tunnel-core --lib`、`--test farewell`、真实 SDK 环回告别用例；双机人工验证尚未做（见下“未验证”）。
 
 ## 2026-11-24：v0.1 CLI 完成（ticket 10）
 
@@ -47,8 +56,9 @@
 | --- | --- |
 | `cargo fmt --all -- --check` | 通过 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | 通过 |
-| `cargo test --workspace` | **111 passed**（tunnel-core 单元 71 + `listener_echo` 14 + `rule_sync` 8 + tunnel-cli 单元 4 + 黑盒 14） |
+| `cargo test --workspace` | **145 passed**（tunnel-core 单元 79 + `farewell` 2 + `listener_echo` 14 + `rule_sync` 8 + tunnel-cli 单元 21 + 黑盒 21） |
 | 真实 SDK 双进程环回 | 2026-11-24 ticket 06/10 手工记录（配对、双向 echo、close/RemoteClosed、审计 `result=ok`）；记录在 `.tmp/`，不提交 |
+| 退出清理与端口重绑 | core 用例 `shutdown_releases_listener_port_for_immediate_rebind`、`peer_farewell_ends_session_and_rsts_active_connections`；`listener_echo` 断开连接后立即 `bind` 同端口成功 |
 | 真机跨平台 | 见上表：macOS ↔ Windows、Termux ↔ Linux |
 
 ### CI 与发布产物（2026-11-25）
@@ -70,8 +80,8 @@
 | **ticket 08：Windows ↔ Termux LAN 双机验收** | **部分完成**：配对与链路已通（比较码一致）；真实 `ssh -p` 双机、端口冲突、RST、防火墙/后台限制记录仍缺。 |
 | **ticket 09：真实 NAT/CGNAT** | **未完成、未验证**。没有跨网配对、没有 STUN/ICE 诊断字段、没有无中继证据。 |
 | 真实 `ssh -p` 会话 | 真机记录里是端口转发与短连接，OpenSSH 长会话未留存记录。 |
-| 会话丢失 120s → 退出码 1 | 只有代码路径与 core 测试覆盖，没有端到端手工记录。 |
-| 对端主动退出 → 会话结束 | 未实现；当前会走重连（issue 11）。 |
+| 断链 5 秒 → 退出码 0 | 由 core 单元/集成测试与真实 SDK 环回告别用例覆盖，没有双机人工记录。 |
+| 对端主动退出 → 会话结束 | **已实现**（`0x03 Farewell`）：mock 双会话与真实 SDK 环回测试覆盖；未做跨设备人工复核。 |
 | 绑定失败文案 | 由 core 单元/集成测试覆盖，未在真实端口冲突场景手工复核。 |
 
 ## 现在能做什么
@@ -79,11 +89,11 @@
 - 从 Releases 下载对应平台二进制，两端配对后 `add <本机端口> <对端端口>` 即可转发；Android/Termux 用 `android-aarch64` 包。
 - 同机双进程或跨设备（Windows/macOS/Linux/Termux）都能建立会话；`status` 看规则与活动连接。
 - 所有 UI 文案与退出码有黑盒测试兜底。
+- 一端 `quit` 后，另一端 1 秒内打印 `[对端] 对端已退出` 并退出 0；链路断开 5 秒未恢复打印「断开连接」并退出 0。
 
 ## 下一任务
 
-1. issue 11：会话级告别（一端 `quit` → 另一端立即结束，不重连 120 秒）。
-2. issue 13：CLI 输出层与日志分流（清行重绘、空回车、`exit`/`q` 别名、默认 `warn` + `--log-file`；吸收已归档的 issue 12）。
-3. ticket 08：Windows ↔ Termux 双机验收全清单（真实 `ssh -p`、RST、端口冲突、后台限制）。
-4. ticket 09：真实路由器/CGNAT 记录、无中继证据。
-5. TUI（v0.2）/GUI（v0.3）不阻塞 v0.1。
+1. issue 13：CLI 输出层与日志分流（清行重绘、空回车、`exit`/`q` 别名、默认 `warn` + `--log-file`；吸收已归档的 issue 12）。
+2. ticket 08：Windows ↔ Termux 双机验收全清单（真实 `ssh -p`、RST、端口冲突、后台限制），补本票的双机告别复核。
+3. ticket 09：真实路由器/CGNAT 记录、无中继证据。
+4. TUI（v0.2）/GUI（v0.3）不阻塞 v0.1。

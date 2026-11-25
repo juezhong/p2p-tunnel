@@ -25,7 +25,8 @@ use crate::api::{Forward, TunnelError};
 use crate::bridge;
 use crate::limits::StreamBudget;
 use crate::protocol::{
-    RuleFrame, CODE_PROTOCOL_ERROR, DATA_MAGIC, FRAME_HEADER_LEN, FRAME_HELLO, FRAME_RULE_LIST,
+    RuleFrame, CODE_PROTOCOL_ERROR, DATA_MAGIC, FRAME_FAREWELL, FRAME_HEADER_LEN, FRAME_HELLO,
+    FRAME_RULE_LIST,
 };
 use crate::transport::{open_bi_with_timeout, DataLink, TunnelRead, TunnelStream, TunnelWrite};
 
@@ -199,6 +200,10 @@ async fn state_reader_loop(
                             .await
                             .map_err(|_| TunnelError::Internal("状态更新通道已关闭".into()))?;
                     }
+                    RuleFrame::Farewell => {
+                        tracing::debug!("状态流收到 Farewell，按正常结束处理");
+                        return Ok(());
+                    }
                 }
             }
             _ = cancel.changed() => return Ok(()),
@@ -258,13 +263,15 @@ async fn read_frame(
     RuleFrame::decode(&buffer[..FRAME_HEADER_LEN + declared]).map_err(TunnelError::from)
 }
 
-/// 首字节分流：`0x50` 是数据流，`0x01`/`0x02` 是状态流，其它 reset(0x01)。
+/// 首字节分流：`0x50` 是数据流，`0x01`/`0x02` 是状态流，`0x03` 是对端告别，其它 reset(0x01)。
 ///
 /// 运行在每条 `accept_bi()` 流上；数据流交给 [`bridge`]，状态流交给
-/// 分发任务（新状态流替换旧状态流）。
+/// 分发任务（新状态流替换旧状态流），Farewell 通过独立的告别信号通知
+/// 会话主循环（SPEC §5.2、§9.5）。
 pub(crate) fn spawn_demux(
     link: Arc<dyn DataLink>,
     state: mpsc::Sender<StateStreamParts>,
+    farewell: mpsc::Sender<()>,
     link_lost: watch::Receiver<u64>,
     budget: StreamBudget,
     peer_session: Arc<str>,
@@ -278,6 +285,7 @@ pub(crate) fn spawn_demux(
                     tokio::spawn(classify_stream(
                         stream,
                         state,
+                        farewell.clone(),
                         link_lost.clone(),
                         budget.clone(),
                         peer_session.clone(),
@@ -296,6 +304,7 @@ pub(crate) fn spawn_demux(
 async fn classify_stream(
     stream: Box<dyn TunnelStream>,
     state: mpsc::Sender<StateStreamParts>,
+    farewell: mpsc::Sender<()>,
     link_lost: watch::Receiver<u64>,
     budget: StreamBudget,
     peer_session: Arc<str>,
@@ -338,6 +347,21 @@ async fn classify_stream(
         if state.send(parts).await.is_err() {
             tracing::debug!("状态流分发通道已关闭");
         }
+    } else if first_byte == FRAME_FAREWELL {
+        // Farewell 帧长度必须是 0；剩余 2 字节仍受同一个首帧截止时间约束。
+        let mut rest = [0u8; 2];
+        let read_rest =
+            tokio::time::timeout_at(started + bridge::HEADER_TIMEOUT, read.read_exact(&mut rest))
+                .await;
+        if !matches!(read_rest, Ok(Ok(_))) || u16::from_be_bytes(rest) != 0 {
+            let _ = write.reset(CODE_PROTOCOL_ERROR);
+            return;
+        }
+        if farewell.send(()).await.is_err() {
+            tracing::debug!("告别信号通道已关闭");
+        }
+        // 对端已告别：只做正常半关闭，不 reset（SPEC §5.4 关闭语义）。
+        let _ = write.finish();
     } else {
         let _ = write.reset(CODE_PROTOCOL_ERROR);
     }
@@ -452,7 +476,7 @@ mod tests {
         frame.extend_from_slice(payload);
         match RuleFrame::decode(&frame).expect("解码 RuleList") {
             RuleFrame::RuleList(rules) => rules,
-            RuleFrame::Hello => panic!("期望 RuleList"),
+            RuleFrame::Hello | RuleFrame::Farewell => panic!("期望 RuleList"),
         }
     }
 
@@ -612,8 +636,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_frames_are_rejected_as_protocol_errors() {
-        // 未知帧类型。
-        assert_rejected(vec![0x03, 0x00, 0x00], true).await;
+        // 未知帧类型（0x03 已分配给 Farewell）。
+        assert_rejected(vec![0x04, 0x00, 0x00], true).await;
         // RuleList count 与 payload 不匹配。
         assert_rejected(
             vec![
@@ -722,10 +746,12 @@ mod tests {
         let responder = b.accept_bi().await.expect("accept_bi");
         let (mut read, mut write) = initiator.split();
         let (state_tx, _state_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
+        let (farewell_tx, _farewell_rx) = mpsc::channel(1);
         let (_lost_tx, lost_rx) = watch::channel(0u64);
         let task = tokio::spawn(classify_stream(
             responder,
             state_tx,
+            farewell_tx,
             lost_rx,
             StreamBudget::new(),
             Arc::from("test-session"),
@@ -763,6 +789,73 @@ mod tests {
         assert!(
             error.to_string().contains("0x01"),
             "应 reset 0x01，实际：{error}"
+        );
+        task.await.expect("classify 任务结束");
+    }
+
+    /// 首字节取流：对端在专用双向流上写 `Farewell`，分流器应上报告别信号
+    /// 且不 reset（SPEC §5.2、§9.5）。
+    #[tokio::test]
+    async fn farewell_stream_signals_session_end_without_reset() {
+        let (a, b) = MockLink::pair();
+        let initiator = a.open_bi().await.expect("open_bi");
+        let responder = b.accept_bi().await.expect("accept_bi");
+        let (mut read, mut write) = initiator.split();
+        let (state_tx, _state_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
+        let (farewell_tx, mut farewell_rx) = mpsc::channel(1);
+        let (_lost_tx, lost_rx) = watch::channel(0u64);
+        let task = tokio::spawn(classify_stream(
+            responder,
+            state_tx,
+            farewell_tx,
+            lost_rx,
+            StreamBudget::new(),
+            Arc::from("test-session"),
+        ));
+
+        write
+            .write_all(&encode(&RuleFrame::Farewell))
+            .await
+            .expect("写 Farewell");
+        tokio::time::timeout(Duration::from_secs(2), farewell_rx.recv())
+            .await
+            .expect("应上报告别")
+            .expect("通道未关闭");
+        task.await.expect("classify 任务结束");
+
+        // 对端没有 reset：读半应直接读到 EOF。
+        let mut buffer = [0u8; 1];
+        assert_eq!(read.read(&mut buffer).await.expect("读到 EOF"), 0);
+    }
+
+    /// Farewell 的 payload 长度必须为 0；非 0 按协议错误 reset。
+    #[tokio::test]
+    async fn farewell_with_nonzero_length_is_reset() {
+        let (a, b) = MockLink::pair();
+        let initiator = a.open_bi().await.expect("open_bi");
+        let responder = b.accept_bi().await.expect("accept_bi");
+        let (mut read, mut write) = initiator.split();
+        let (state_tx, _state_rx) = mpsc::channel(STATE_UPDATE_CHANNEL);
+        let (farewell_tx, _farewell_rx) = mpsc::channel(1);
+        let (_lost_tx, lost_rx) = watch::channel(0u64);
+        let task = tokio::spawn(classify_stream(
+            responder,
+            state_tx,
+            farewell_tx,
+            lost_rx,
+            StreamBudget::new(),
+            Arc::from("test-session"),
+        ));
+
+        write
+            .write_all(&[FRAME_FAREWELL, 0x00, 0x01, 0x00])
+            .await
+            .expect("写非法 Farewell");
+        let mut buffer = [0u8; 1];
+        let error = read.read(&mut buffer).await.expect_err("应 reset");
+        assert!(
+            error.to_string().contains("0x01"),
+            "应以 0x01 reset，实际：{error}"
         );
         task.await.expect("classify 任务结束");
     }
