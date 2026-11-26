@@ -194,7 +194,7 @@ fn status_during_pairing_is_rejected() {
     let out = run(&[], "2\nstatus\nquit\n");
     assert_success(&out);
     assert!(
-        out.stdout.contains("无效的配对码"),
+        out.stdout.contains("这里要粘贴对方的 INVITE"),
         "等待 INVITE 时命令应被拒绝\nstdout:\n{}",
         out.stdout
     );
@@ -231,7 +231,7 @@ fn add_without_pairing_is_rejected_by_pairing_stage() {
     assert_success(&out);
     assert!(
         out.stdout
-            .contains("尚未连接：配对阶段只能输入 1/2（创建/加入）或 3（退出）"),
+            .contains("尚未连接：配对阶段只能输入 1（创建）/ 2（加入）/ 3（退出）"),
         "stdout:\n{}",
         out.stdout
     );
@@ -377,13 +377,30 @@ fn menu_numbers_work_before_pairing() {
 }
 
 #[test]
+fn pairing_stage_rejects_text_aliases() {
+    // 配对前只认 1/2/3；create/join 是已连接后的拒绝文案，不是菜单入口。
+    let out = run(&[], "create\njoin\n1\n3\n");
+    assert_success(&out);
+    assert_eq!(
+        out.stdout
+            .matches("尚未连接：配对阶段只能输入 1（创建）/ 2（加入）/ 3（退出）")
+            .count(),
+        2,
+        "stdout:\n{}",
+        out.stdout
+    );
+    // 立即退出时配对邀请可能来不及打印；这里只验证入口被拒。
+    assert!(!out.stdout.contains("配对失败"), "stdout:\n{}", out.stdout);
+}
+
+#[test]
 fn awaiting_invite_rejects_commands_instead_of_pairing() {
     // v0.1.3 缺陷：等待 INVITE 时输入 `add ...` 被当作配对码送出，报了
     // 一次莫名其妙的「配对失败」，且命令本身没有执行。
     let out = run(&[], "2\nadd 8080 8080\nquit\n");
     assert_success(&out);
     assert!(
-        out.stdout.contains("无效的配对码"),
+        out.stdout.contains("这里要粘贴对方的 INVITE"),
         "stdout:\n{}",
         out.stdout
     );

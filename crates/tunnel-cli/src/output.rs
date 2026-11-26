@@ -6,7 +6,6 @@
 
 use std::io::Write;
 
-const PROMPT: &str = "> ";
 /// 回到行首并清掉整行（提示符 + 用户已经敲了一半的命令）。
 const CLEAR_LINE: &str = "\r\x1b[K";
 
@@ -20,6 +19,8 @@ pub struct Output<W: Write> {
     wrote_since_prompt: bool,
     /// 未提交的输入镜像；tty 下重绘时原样恢复。
     input: String,
+    /// 当前提示符；随交互状态切换（`> `、`INVITE> `、`[NAT 打洞]> ` 等）。
+    prompt: String,
 }
 
 impl<W: Write> Output<W> {
@@ -30,6 +31,7 @@ impl<W: Write> Output<W> {
             prompt_shown: false,
             wrote_since_prompt: false,
             input: String::new(),
+            prompt: "> ".to_string(),
         }
     }
 
@@ -42,7 +44,8 @@ impl<W: Write> Output<W> {
             self.write(CLEAR_LINE);
             self.write(text);
             self.write("\r\n");
-            self.write(PROMPT);
+            let prompt = self.prompt.clone();
+            self.write(&prompt);
             self.write_mirror();
             self.wrote_since_prompt = false;
         } else {
@@ -67,7 +70,8 @@ impl<W: Write> Output<W> {
         if self.prompt_shown && !self.wrote_since_prompt {
             return;
         }
-        self.write(PROMPT);
+        let prompt = self.prompt.clone();
+        self.write(&prompt);
         self.write_mirror();
         self.prompt_shown = true;
         self.wrote_since_prompt = false;
@@ -85,7 +89,25 @@ impl<W: Write> Output<W> {
         self.input.push_str(input);
         if self.tty && self.prompt_shown {
             self.write(CLEAR_LINE);
-            self.write(PROMPT);
+            let prompt = self.prompt.clone();
+            self.write(&prompt);
+            self.write_mirror();
+            self.flush();
+            self.wrote_since_prompt = false;
+        }
+    }
+
+    /// 切换提示符；tty 下若正停在提示符行，立即清行重绘成新提示符。
+    pub fn set_prompt(&mut self, prompt: &str) {
+        if self.prompt == prompt {
+            return;
+        }
+        self.prompt.clear();
+        self.prompt.push_str(prompt);
+        if self.tty && self.prompt_shown {
+            self.write(CLEAR_LINE);
+            let prompt = self.prompt.clone();
+            self.write(&prompt);
             self.write_mirror();
             self.flush();
             self.wrote_since_prompt = false;
@@ -204,6 +226,26 @@ mod tests {
         assert!(text.ends_with("\r\x1b[K> abc"), "{text:?}");
         // 每次重绘都以清行开始，不叠加旧内容。
         assert_eq!(text.matches("\r\x1b[K> ").count(), 3, "{text:?}");
+    }
+
+    #[test]
+    fn set_prompt_redraws_and_keeps_partial_input() {
+        let mut out = Output::new(Vec::new(), true);
+        out.prompt();
+        out.set_input("P2PR-");
+        out.set_prompt("INVITE> ");
+        let text = rendered(out);
+        assert!(text.ends_with("\r\x1b[KINVITE> P2PR-"), "{text:?}");
+    }
+
+    #[test]
+    fn non_tty_prompt_change_applies_to_next_prompt() {
+        let mut out = Output::new(Vec::new(), false);
+        out.prompt();
+        out.line("粘贴对方的 INVITE：");
+        out.set_prompt("INVITE> ");
+        out.prompt();
+        assert_eq!(rendered(out), "> 粘贴对方的 INVITE：\nINVITE> ");
     }
 
     #[test]

@@ -152,6 +152,7 @@ async fn run() -> ExitCode {
                         if !handle_input(line.trim(), &commands, &mut ui, &mut out).await {
                             break;
                         }
+                        out.set_prompt(&prompt_text(&ui));
                         out.prompt();
                     }
                     Some(InputEvent::Byte(byte)) => match editor.feed(byte) {
@@ -163,6 +164,7 @@ async fn run() -> ExitCode {
                             if !handle_input(line.trim(), &commands, &mut ui, &mut out).await {
                                 break;
                             }
+                            out.set_prompt(&prompt_text(&ui));
                             out.prompt();
                         }
                         EditAction::Interrupt => {
@@ -188,6 +190,7 @@ async fn run() -> ExitCode {
                         if ui.session_lost || ui.session_ended {
                             break;
                         }
+                        out.set_prompt(&prompt_text(&ui));
                         out.prompt();
                     }
                     None => {
@@ -240,8 +243,10 @@ async fn handle_input<W: Write>(
     out: &mut Output<W>,
 ) -> bool {
     if line.is_empty() {
-        if ui.awaiting == Awaiting::Invite {
-            out.line("[!] INVITE 不能为空");
+        match ui.awaiting {
+            Awaiting::Invite => out.line("[!] 这里要粘贴对方的 INVITE（P2PR- 开头）"),
+            Awaiting::Reply => out.line("[!] 这里要粘贴对方的 REPLY（P2PR- 开头）"),
+            Awaiting::None => {}
         }
         return true;
     }
@@ -262,7 +267,13 @@ async fn handle_input<W: Write>(
             // 只有 `P2PR-` 开头的配对码才送出；命令不会被误当配对码，
             // 避免 `add` 之类的输入触发一次失败配对（v0.1.3 真机缺陷）。
             if !line.starts_with("P2PR-") {
-                out.line("[!] 无效的配对码：应以 P2PR- 开头；输入 quit 退出");
+                let what = match ui.awaiting {
+                    Awaiting::Invite => "INVITE",
+                    _ => "REPLY",
+                };
+                out.line(&format!(
+                    "[!] 这里要粘贴对方的 {what}（P2PR- 开头）；输入 3 退出"
+                ));
                 return true;
             }
             match std::mem::replace(&mut ui.awaiting, Awaiting::None) {
@@ -277,13 +288,13 @@ async fn handle_input<W: Write>(
             return true;
         }
         match command {
-            "1" | "create" => send(commands, Command::CreateInvite, out).await,
-            "2" | "join" => {
+            "1" => send(commands, Command::CreateInvite, out).await,
+            "2" => {
                 ui.awaiting = Awaiting::Invite;
                 out.line("粘贴对方的 INVITE：");
             }
             _ => {
-                out.line("[!] 尚未连接：配对阶段只能输入 1/2（创建/加入）或 3（退出）");
+                out.line("[!] 尚未连接：配对阶段只能输入 1（创建）/ 2（加入）/ 3（退出）");
             }
         }
         return true;
@@ -437,6 +448,21 @@ fn format_status(ui: &UiState) -> Vec<String> {
 fn print_status<W: Write>(ui: &UiState, out: &mut Output<W>) {
     for line in format_status(ui) {
         out.line(&line);
+    }
+}
+
+/// 提示符只描述当前状态：等配对码时标出在等什么，连接后标出连接类别。
+fn prompt_text(ui: &UiState) -> String {
+    if ui.ready_seen {
+        return match ui.path {
+            Some(label) => format!("[{label}]> "),
+            None => "> ".to_string(),
+        };
+    }
+    match ui.awaiting {
+        Awaiting::Invite => "INVITE> ".to_string(),
+        Awaiting::Reply => "REPLY> ".to_string(),
+        Awaiting::None => "> ".to_string(),
     }
 }
 
@@ -628,6 +654,22 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn prompt_tracks_awaiting_and_connection_kind() {
+        let mut ui = UiState::default();
+        assert_eq!(prompt_text(&ui), "> ");
+        ui.awaiting = Awaiting::Invite;
+        assert_eq!(prompt_text(&ui), "INVITE> ");
+        ui.awaiting = Awaiting::Reply;
+        assert_eq!(prompt_text(&ui), "REPLY> ");
+        ui.awaiting = Awaiting::None;
+        ui.ready_seen = true;
+        ui.path = Some("NAT 打洞");
+        assert_eq!(prompt_text(&ui), "[NAT 打洞]> ");
+        ui.path = None;
+        assert_eq!(prompt_text(&ui), "> ");
+    }
+
     fn connected_ui() -> UiState {
         let mut ui = UiState {
             link: Some(LinkState::Connected),
@@ -713,7 +755,7 @@ mod tests {
         }
         let text = String::from_utf8(out.into_writer()).expect("输出应为 UTF-8");
         assert!(
-            text.contains("配对阶段只能输入 1/2（创建/加入）或 3（退出）"),
+            text.contains("配对阶段只能输入 1（创建）/ 2（加入）/ 3（退出）"),
             "{text}"
         );
 
